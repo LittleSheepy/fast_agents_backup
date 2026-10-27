@@ -1,7 +1,8 @@
-"""MCP 工具适配器 —— 两种形态：细粒度展开 / 粗粒度自动展开。"""
+"""MCP 工具适配器 —— 两种形态：细粒度展开 / 粗粒度门脸工具。"""
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any, Dict, List, Optional, Union
 
@@ -70,9 +71,6 @@ class MCPToolAdapter(ToolBase):
 
     def run(self, **kwargs: Any) -> Union[str, ToolResult]:
         try:
-            # 如果 args_schema 没有结构化定义，可能存在一个 input 字符串参数
-            if not self.tool_info.has_structured_input and "input_text" in kwargs:
-                kwargs = {"input": kwargs.pop("input_text")}
             result = self.client.call_tool(self.tool_info.name, kwargs)
         except MCPCallError as e:
             return ToolResult.fail(str(e))
@@ -82,57 +80,94 @@ class MCPToolAdapter(ToolBase):
         return ToolResult.ok(text, artifact={"content": [c for c in result.content if c.get("type") == "text"]})
 
 
-class MCPServerTool(ToolBase):
-    """粗粒度适配器：一个 MCP server 对应一个工具，内部通过 auto_expand 再展开一层。
+# ── 粗粒度工具参数模型（A1 方案：结构化嵌套）──────────────────────
 
-    保留用于与你 react_agent.py L139-155 的 `auto_expand` 协议兼容：
-    暴露 `auto_expand=True` 和 `_available_tools` 属性，add_tool 时会自动展开。
-    这种形态下每个子工具只有一个 input 字符串参数，适合单入参工具；多参数工具
-    建议用 MCPToolAdapter（expand=True）。
+class MCPServerCallInput(BaseModel):
+    action: str = Field(
+        description="动作类型：list_tools 查看该 MCP 服务器提供了哪些工具；call_tool 调用其中的某个工具",
+    )
+    tool_name: Optional[str] = Field(
+        default=None,
+        description="action=call_tool 时必填：要调用的子工具名",
+    )
+    arguments: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="action=call_tool 时必填：传给子工具的参数字典（key/value 形式）；"
+                    "如果子工具只接收一个 input 字符串参数，传 {'input': '...'} 即可",
+    )
+
+
+class MCPServerTool(ToolBase):
+    """粗粒度门脸工具：一个 MCP server 对应一个工具，模型通过 action 选择查看子工具或调用子工具。
+
+    与细粒度 MCPToolAdapter 的区别：
+    - 细粒度（expand=fine）：每个远端工具独立一个 ToolBase，模型直接点名调用，参数 schema 完整；
+    - 粗粒度（expand=coarse）：每个 server 一个门脸工具，模型先 list_tools 看有什么，再 call_tool 调用，
+      适合工具数量多、不想一次性铺开的场景（节省工具表长度）。
     """
 
     tags = ["mcp"]
+    args_schema = MCPServerCallInput
 
     def __init__(self, client: MCPClient, server_name: str, tools: List[ToolInfo], prefix_sep: str = "__"):
         self.client = client
         self.server_name = server_name
         self._tools_list = tools
-        self.auto_expand = True
-        self._available_tools = [{"name": t.name, "description": t.description} for t in tools]
-        name = f"mcp_{server_name}"
-        description = f"[MCP:{server_name}] 聚合工具，内部包含 {len(tools)} 个子工具：{', '.join(t.name for t in tools)}"
+        self._tools_index = {t.name: t for t in tools}
+        name = f"mcp{prefix_sep}{server_name}"
+        tool_names = ", ".join(t.name for t in tools) if tools else "(无)"
+        description = (
+            f"[MCP:{server_name}] 门脸工具：封装了该 MCP 服务器提供的 {len(tools)} 个子工具。"
+            f"先用 action='list_tools' 查看子工具清单，再用 action='call_tool' 调用指定子工具。"
+            f"可用子工具：{tool_names}"
+        )
         super().__init__(name=name, description=description)
 
-    def run(self, payload: Any = None, **kwargs: Any) -> Union[str, ToolResult]:
-        """payload 支持 dict 或字符串；也支持把 dict 字段作为关键字参数传入
-        （ToolBase.invoke 在 args_schema=None 时会把 dict 拆成 kwargs）。"""
-        if payload is None and kwargs:
-            payload = kwargs
-        if isinstance(payload, dict):
-            action = payload.get("action", "call_tool")
-            if action == "list_tools":
-                lines = []
-                for t in self._tools_list:
-                    lines.append(f"- {t.name}: {t.description}")
-                return ToolResult.ok("\n".join(lines) if lines else "(无可用工具)")
-            tool_name = payload.get("tool_name", "")
-            arguments = payload.get("arguments", {})
-        else:
-            return ToolResult.fail("MCPServerTool 需要 dict 格式 payload")
+    def _list_tools_text(self) -> str:
+        if not self._tools_list:
+            return f"MCP 服务器 {self.server_name} 当前没有可用工具。"
+        lines = [f"## {self.server_name} 提供的子工具：\n"]
+        for t in self._tools_list:
+            schema = t.input_schema or {}
+            props = schema.get("properties", {}) or {}
+            required = set(schema.get("required", []) or [])
+            param_lines = []
+            for pname, pdef in props.items():
+                mark = "必填" if pname in required else "可选"
+                desc = pdef.get("description", "")
+                type_name = pdef.get("type", "any")
+                param_lines.append(f"    - {pname} ({type_name}, {mark}): {desc}")
+            params_text = "\n" + "\n".join(param_lines) if param_lines else ""
+            lines.append(f"- **{t.name}**：{t.description}{params_text}")
+        return "\n".join(lines)
+
+    def run(self, action: str, tool_name: Optional[str] = None,
+            arguments: Optional[Dict[str, Any]] = None) -> Union[str, ToolResult]:
+        action = (action or "").strip().lower()
+
+        if action == "list_tools":
+            return ToolResult.ok(self._list_tools_text())
+
+        if action != "call_tool":
+            return ToolResult.fail(
+                f"不支持的 action: '{action}'，只能是 'list_tools' 或 'call_tool'"
+            )
 
         if not tool_name:
-            return ToolResult.fail("需要提供 tool_name")
-        # 兼容钩子传 {"input": "..."} 的单入参形态
-        if isinstance(arguments, dict) and set(arguments.keys()) == {"input"} and len(self._tools_list) > 0:
-            arguments = arguments["input"]
-        if not isinstance(arguments, dict):
-            arguments = {"input": arguments}
+            return ToolResult.fail("action=call_tool 时必须提供 tool_name；可先调用 list_tools 查看可用子工具")
 
-        info = next((t for t in self._tools_list if t.name == tool_name), None)
-        if info is None:
-            return ToolResult.fail(f"工具 '{tool_name}' 不存在；可用：{', '.join(t.name for t in self._tools_list)}")
+        if tool_name not in self._tools_index:
+            available = ", ".join(self._tools_index.keys()) or "(无)"
+            return ToolResult.fail(f"子工具 '{tool_name}' 不存在于 {self.server_name}；可用：{available}")
+
+        info = self._tools_index[tool_name]
+        args: Dict[str, Any] = arguments or {}
+        # 如果该子工具不是结构化入参（只有 input 字段），且 arguments 传的是裸字符串，自动包装
+        if not info.has_structured_input and isinstance(args, str):
+            args = {"input": args}
+
         try:
-            result = self.client.call_tool(tool_name, arguments)
+            result = self.client.call_tool(tool_name, args)
         except MCPCallError as e:
             return ToolResult.fail(str(e))
         text = result.as_text()

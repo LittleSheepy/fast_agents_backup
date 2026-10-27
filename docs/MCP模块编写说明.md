@@ -1,544 +1,286 @@
-# MCP 模块编写说明
+# MCP 模块编写说明（fast_agents）
 
-> 适用框架：`fast_agents` v0.0.1（含 tools / memory / skills）
-> 适配系统：Windows / macOS / Linux
-> MCP 协议版本：`2024-11-05`
+> 适配你的代码风格（对齐 `tools/` `memory/` `skills/` 的分层），Windows 兼容，零新增依赖（SSE 可选 requests）。
 
 ---
 
-## 一、MCP 是什么：和你的 Tools/Skills 的关系
+## 一、模块架构
 
-MCP（Model Context Protocol）是 Anthropic 在 2024 年底提出的一个 **"AI 工具的 USB 接口"** 标准。你可以把它理解为：把"工具"这件事从「**写 Python 代码 → 继承 ToolBase → 注册到 ToolRegistry**」这一条路，扩展出第二条「**启动一个独立进程/连一个远程服务 → 自动发现它有哪些工具 → 直接调用**」的路。
+```
+fast_agents/mcp/               ← 单数目录，对齐 tools/ memory/ skills/
+├── __init__.py                模块出口
+├── errors.py                  三层异常：MCPConnectionError / MCPProtocolError / MCPCallError
+├── models.py                  pydantic 模型：ToolInfo / CallResult / InitializeResult / ServerCapabilities
+├── transports.py              Transport 抽象 + StdioTransport + SSETransport + make_stdio 便捷工厂
+├── client.py                  单个 MCP server 客户端（握手 / tools/list / tools/call）
+├── registry.py                多 server 注册表：add_stdio / add_sse / connect_all / register_into / close_all
+└── tool.py                    两种工具适配器：MCPToolAdapter（细） + MCPServerTool（粗）
 
-| 维度 | 你的 Tools | 你的 Skills | **MCP** |
-|------|-----------|-------------|---------|
-| 形态 | Python 类，进程内 | 文件夹+SKILL.md/脚本，进程内 | **独立进程/远程 HTTP 服务** |
-| 写一个要会 | Python | Markdown | **任何语言**（Python/Node/Go/Rust...） |
-| 复用范围 | 本项目内 | 本项目内 | **任何支持 MCP 的客户端都能用**（Claude Desktop、Cursor、LangChain、你的 fast_agents...） |
-| 安全边界 | 同一进程，出错会影响 Agent | 同进程 | **进程隔离**，MCP server 崩溃不影响 Agent |
-| 安装方式 | pip 装到环境里 | 放到 .skills/ 目录 | `uvx mcp-server-xxx` / `npx @modelcontextprotocol/...` 即装即用 |
+fast_agents/tools/builtin/mcp_tool.py    ← MCP 通用管理工具（与 memory_tool.py 同层级、同风格）
+├── ListMcpServersTool         list_mcp_servers
+├── ConnectMcpServerTool       connect_mcp_server（运行时动态连接，自动展开工具并刷新 prompt）
+├── DisconnectMcpServerTool    disconnect_mcp_server
+└── build_mcp_tools(registry, tool_registry, refresh_prompt)   工厂函数
+```
 
-**一句话定位**：Tools 是你「自己写的工具」，Skills 是「写死的 SOP 流程」，MCP 是「从外部世界接入的标准化工具集合」。
+数据流：
 
-### 业界主流实现对比
+```
+ReActAgent
+   ↓  tool_registry.invoke_tool("fs__read_file", {...})
+ToolRegistry
+   ↓  命中 MCPToolAdapter 实例
+MCPToolAdapter.run()
+   ↓  self.client.call_tool(...)
+MCPClient._request("tools/call", ...)   ← JSON-RPC 2.0
+   ↓  self.transport.send/recv
+Transport（StdioTransport / SSETransport）
+   ↓
+子进程 / HTTP SSE 远端 server
+```
 
-| 框架 | MCP 实现方式 | 优缺点 |
-|------|-------------|--------|
-| **LangChain** `langchain-mcp-adapters` | 把每个 MCP tool 包装成 `BaseTool` 子类，用 `MultiServerMCPClient` 管理多个连接 | 优点：生态最成熟；缺点：强依赖官方 SDK，`langchain-core` 全家桶带进来 |
-| **OpenAI Agents SDK** | 通过 `MCPServer` 类 + `stdio`/`sse` 传输 | 优点：简洁；缺点：只支持 OpenAI 模型 |
-| **Anthropic 官方 SDK** | 纯底层 transport，自己拼调用 | 最原始、最贴近协议，但要自己管 handshake、工具列表缓存 |
-| **你的 fast_agents.mcp**（本次实现） | 零重型依赖，分 transports / client / registry / tool 四层；同时支持 auto_expand 粗粒度接入 **和** Schema 级细粒度接入 | 优点：不引第三方、Windows 友好、和你现有 ToolBase 无缝；缺点：高级能力（采样/sampling、roots、资源订阅）暂未实现 |
+核心设计原则：**MCP 工具对模型来说就是普通 ToolBase 实例**——注册进 ToolRegistry 后和本地 `python_calculator` 没有区别，LLM 无感知。
 
 ---
 
-## 二、代码架构：完全贴合你现有风格
+## 二、两种展开方式对比
 
-### 2.1 模块目录
+| 维度 | `MCPToolAdapter`（细粒度，`expand=True`，**推荐**） | `MCPServerTool`（粗粒度，`expand=False`） |
+|---|---|---|
+| 注册粒度 | 每个远端工具一个 ToolBase | 每个 server 一个聚合工具 |
+| 工具名 | `<server>__<tool>`（如 `fs__read_file`） | `mcp_<server>`（如 `mcp_fs`） |
+| args_schema | 从远端 `inputSchema` 动态生成 pydantic 模型，**每个字段带类型/描述/enum/必填** | 单个 `payload: dict` 参数，**靠你 `react_agent.py` 的 auto_expand 钩子再展开一层** |
+| 多参数工具 | ✅ 原生支持，模型能准确传 `message/prefix/repeat` | ⚠️ 只有单 `input` 字符串，多参数会丢 |
+| schema 导出 to_openai/to_anthropic | ✅ 完整 | 仅描述级 |
+| 模型调用准确率 | 高 | 一般 |
 
-我把 MCP 模块放在单数目录 `fast_agents/mcp/`，和你已有的 `tools/`、`memory/`、`skills/` 命名完全一致：
-
-```
-fast_agents/mcp/
-├── __init__.py       # 模块出口，导出所有公共符号
-├── errors.py         # 异常类体系（连接/协议/调用三层）
-├── models.py         # pydantic 数据模型（MCPToolInfo / MCPToolCallResult 等）
-├── transports.py     # 传输层抽象 + StdioTransport + SSETransport
-├── client.py         # 单个 MCP server 的客户端（握手/发现/调用）
-├── registry.py       # 多 server 注册表，批量管理和注册工具
-└── tool.py           # 两种工具适配器（MCPServerTool / MCPToolAdapter）
-```
-
-**分层对应关系**（和你其他模块一一对应）：
-
-| 层 | tools | memory | skills | **mcp** |
-|----|-------|--------|--------|---------|
-| 数据模型 | tool_result.py | schema.py | models.py | **models.py** |
-| 异常 | tool_exception.py | (在 manager 里) | —— | **errors.py** |
-| 实现/加载 | tool_base.py | sqlite_store.py | loader.py | **transports.py + client.py** |
-| 注册管理 | tool_registry.py | manager.py | registry.py | **registry.py** |
-| 对外工具 | builtin/*.py | tool.py (RememberTool等) | (通过 registry.get_tools 暴露) | **tool.py** |
-
-### 2.2 分层数据流
-
-```
-┌─────────────────────────────────────────────────────────┐
-│  ReActAgent                                             │
-│  ┌───────────────────────────────────────────────────┐  │
-│  │  ToolRegistry (你已有的，本地工具 + MCP工具混在一起)│  │
-│  └───────────────────────────────────────────────────┘  │
-│        ▲                          ▲                     │
-│        │ register_tool()          │ invoke_tool()       │
-│        │                          │                     │
-│  ┌─────┴──────────────────────────┴─────┐               │
-│  │  MCPRegistry                         │               │
-│  │  ┌──────────────┐ ┌──────────────┐   │               │
-│  │  │  MCPClient 1 │ │  MCPClient 2 │   │   连接池       │
-│  │  │ (echo)       │ │ (filesystem) │   │               │
-│  │  └──────┬───────┘ └──────┬───────┘   │               │
-│  └─────────┼────────────────┼───────────┘               │
-│            │                │                           │
-│  ┌─────────┴────────┐ ┌─────┴──────────┐                │
-│  │ StdioTransport   │ │ SSETransport   │   传输层         │
-│  │ (子进程 stdio)   │ │ (HTTP+SSE)     │                │
-│  └─────────┬────────┘ └─────┬──────────┘                │
-└────────────┼────────────────┼───────────────────────────┘
-             │                │
-      ┌──────┴──────┐   ┌─────┴──────┐
-      │ 本地子进程  │   │ 远程HTTP服务│
-      │ (npx/uvx/   │   │ (8001端口) │
-      │  python)    │   └────────────┘
-      └─────────────┘
-```
-
-### 2.3 关键设计决策（和 LangChain 方案的差异）
-
-| 决策点 | LangChain 做法 | 本模块做法 | 理由 |
-|-------|---------------|-----------|------|
-| JSON-RPC 库 | 用官方 `mcp` SDK | **自己实现** | 官方 SDK 有依赖链（anyio、httpx、pydantic-settings、starlette、uvicorn 十几个包），你现在的库连 PyYAML 都有装，没必要为了 MCP 引一堆依赖。完整 JSON-RPC 2.0 客户端只有 100 多行，实现起来很干净。 |
-| 工具展开 | 动态创建 BaseTool，所有参数串成一个 dict | **用 pydantic create_model 把 MCP inputSchema 逐字段展开成强类型** | 你的 ToolBase 依赖 args_schema 做多 provider schema 导出，如果不展开就只有一个笼统的 `arguments: dict`，模型看不到每个字段的 description 和 enum，调用准确率会差一大截。 |
-| 工具命名 | 直接用远程工具原名 | **`<server_name>__<tool_name>` 前缀式** | 多个 server 可能都提供 `read_file`/`search`，直接用原名会冲突；双下划线既好认也不会和本地工具撞名。 |
-| async | 全 async | **同步为主**，SSE 传输后台用线程读事件 | 你的 ReAct 主循环是同步的（tool_registry.invoke_tool 也是同步），做 async 反而要在你的同步循环里加 asyncio.run()，风格不一致。 |
-| 进程启动 | 不处理 Windows | **加 CREATE_NO_WINDOW + 强制 UTF-8 环境变量** | 你是 Windows 系统，不开这个标志子进程会弹出一个黑控制台窗口；不强制 UTF-8 中文输出会变成 GBK 乱码。 |
-| 兼容性 | 要求改造 Agent 代码 | **同时支持两种接入方式**：① 完全兼容你 `add_tool` 里预留的 `auto_expand` 钩子，零改动也能用；② 推荐的 register_into() 方式，在 Agent 初始化时展开成独立工具。 | 你的 react_agent.py L109-127 已经写好了 `if getattr(tool, "auto_expand", False)` 的处理逻辑，这个钩子就是为 MCP 预留的，必须能直接挂上。 |
+粗粒度模式保留是为了兼容你 `react_agent.py` L139-155 已写好的 `auto_expand` 钩子——你哪天想删那段钩子，只要始终走 `expand=True`，就不会受影响。
 
 ---
 
-## 三、核心源码逐文件讲
+## 三、快速上手（Windows PowerShell）
 
-### 3.1 `errors.py` —— 分层异常
+```powershell
+cd D:\00sheepy\01code\02alg_code_bjb\agent\fast_agents
 
-三层异常对应不同的排查方向：
+# 1. 跑单元测试（9/9 全过才算装好）
+python test\test_mcp.py
 
-```
-MCPError（基类）
-├── 连接层：MCPConnectionError / MCPTransportError / MCPTimeoutError
-│   → 排查：命令对不对？子进程有没有启动？端口开没开？网络通不通？
-├── 协议层：MCPProtocolError / MCPHandshakeError
-│   → 排查：协议版本是不是 2024-11-05？返回格式是不是合法 JSON-RPC？
-└── 业务层：MCPCallError / MCPToolNotFoundError / MCPResourceNotFoundError
-    → 排查：工具名拼错没？参数对不对？server 返回 isError=true 看错误内容
+# 2. 跑示例（连接内置 echo_server，验证链路）
+python examples\mcp\mcp_quickstart.py
 ```
 
-### 3.2 `models.py` —— 数据模型
-
-全部用 pydantic BaseModel，对应 MCP 规范字段。关键点：
-
-- `MCPToolInfo.inputSchema` 是服务器声明的 JSON Schema，直接作为 OpenAI function calling 的 `parameters`（OpenAI 的 function calling 本来就是按 JSON Schema 设计的，100% 兼容）；
-- `MCPToolCallResult.content` 是一个数组（可以混合 text/image/resource 链接），`to_text()` 方法拍平成纯文本给 ToolResult.output，原始结构化内容放在 artifact 里供下游使用。
-
-### 3.3 `transports.py` —— 传输层
-
-两个核心传输类，都继承自 `MCPTransport` 抽象基类，对外暴露 `connect/send/receive/close` 四个方法。
-
-**StdioTransport（本地子进程）关键点**：
-
-1. **Windows CREATE_NO_WINDOW**：用 `subprocess.CREATE_NO_WINDOW` 标志，避免弹出黑框；
-2. **UTF-8 强制**：注入 `PYTHONIOENCODING=utf-8` 和 `PYTHONUTF8=1` 环境变量，即使服务器是中文 Windows 默认 GBK 也不会乱码；
-3. **无缓冲管道**：`bufsize=0`，消息一到立刻可读，避免 flush 问题；
-4. **后台读线程 + 消息队列**：主线程发请求后阻塞在 queue.get() 等响应，读线程把 stdout 按行切割后推到队列；
-5. **stderr 保留**：子进程的 stderr 不会污染 stdout 协议流，但会被缓冲起来，超时时可以打印最近几行帮助排查。
-
-**SSETransport（HTTP Server-Sent Events）关键点**：
-
-1. MCP 的 SSE 协议是**两端点**：GET `/sse` 建立长连接收事件，第一个 `endpoint` 事件告诉客户端 POST 消息到哪个 URL；
-2. 依赖 `requests` 库（不强制安装，用的时候才报错提示 `pip install requests`）；
-3. 解析 SSE 事件格式（`event:` / `data:` / `id:` / `retry:` / 空行分隔）。
-
-### 3.4 `client.py` —— MCP 客户端
-
-核心逻辑：
-
-1. **JSON-RPC 请求/响应配对**：每个请求分配递增 id，把 (Event, bucket) 存进 pending dict；后台读线程拿到消息按 id 回填并 set event；主线程 wait event 直到超时。这是一个标准的「同步请求 + 异步响应」模式，不需要 asyncio。
-2. **initialize 握手**：
-   - 发 `initialize` 请求，带上客户端协议版本、能力声明；
-   - 检查服务端返回的协议版本（不严格一致只警告不报错）；
-   - 握手完成后必须发一个 `notifications/initialized` 通知（**没有 id**，服务器不会回）；
-3. **能力发现**：握手完成后一次性调用 `tools/list`、`resources/list`、`prompts/list`，结果缓存起来供后续使用（失败不致命，比如某些 server 没实现 resources 就返回空）；
-4. **call_tool**：发 `tools/call`，返回 `MCPToolCallResult`；如果 `isError=true` 抛 `MCPCallError`（被 ToolBase 层捕获并转成 ToolResult.fail）。
-
-### 3.5 `tool.py` —— 两种工具适配器（重点）
-
-#### 方式一：MCPServerTool（兼容你预留的 auto_expand 钩子，快速接入）
-
-你在 `react_agent.py` L109-127 已经写了这段逻辑：
+### 最小可运行例子
 
 ```python
-if getattr(tool, "auto_expand", False):
-    # 把工具集合拆分为多个子工具，带 _mcp_server_name 前缀
-    for tool_info in tool._available_tools:
-        sub_tool_name = f"{tool.name}_{tool_info['name']}"
-        # ... 动态生成 StructuredTool 并注册
-```
+import sys
+from fast_agents import LLM, ReActAgent, MCPRegistry
+from fast_agents.tools import builtin
+from fast_agents.tools.builtin.mcp_tool import build_mcp_tools
 
-`MCPServerTool` 严格按这个接口约定实现：
-- `name` 属性：服务器名（比如 `"filesystem"`）
-- `auto_expand = True`（类属性，`getattr` 能读到）
-- `_available_tools` 属性：返回 `[{name, description, schema}, ...]`
-- `run(action=..., tool_name=..., arguments=...)`：支持 `list_tools` 和 `call_tool` 两个 action
+llm = LLM(model="...", api_key="...", base_url="...")
 
-**优点**：接入零成本，agent.add_tool(srv_tool) 就完事；
-**缺点**：你那段 auto_expand 代码把子工具的参数做成了一个 `input_text: str`（不是结构化参数），模型要自己拼 JSON 字符串，准确率不如方式二。**适合快速验证、临时调试。**
-
-#### 方式二：MCPToolAdapter（推荐，生产用）
-
-把**每个远程工具**展开成独立的 ToolBase 子类，核心是 `_json_schema_to_pydantic()` 函数——把 MCP server 返回的 inputSchema（JSON Schema）动态转成 pydantic BaseModel：
-
-- 支持 `type` / `properties` / `required` / `description` / `enum` / `default`；
-- `type: ["string", "null"]` 这种联合类型处理为 Optional[str]；
-- `enum` 转 Literal 类型，让 pydantic 自动做取值校验；
-- 不支持的高级关键字（`anyOf` / `oneOf` / `$ref`）退化为 Any，保证不解析失败。
-
-展开后工具名是 `filesystem__read_file` 这种形式（双下划线分隔 server 和 tool），description 前面加 `[MCP:filesystem]` 标记，tags 带上 `mcp` 和 server 名。
-
-**优点**：模型能看到每个字段的 description、类型、enum、是否必填，`to_openai_tool()` 导出的 schema 是精确的，调用准确率比方式一高很多；**缺点**：比方式一多几行初始化代码（用 `MCPRegistry.register_into()` 其实一行就搞定）。
-
-### 3.6 `registry.py` —— 多 server 注册表
-
-管理多个 MCPClient，提供三种接入方式：
-
-| 方法 | 对应适配器 | 场景 |
-|------|-----------|------|
-| `get_server_tools()` | MCPServerTool | 给你 react_agent 现有 add_tool auto_expand 用 |
-| `expand_tools(prefix_sep="__")` | MCPToolAdapter | 自己拿到工具列表做定制 |
-| `register_into(tool_registry)` | MCPToolAdapter | **最常用**，一行把所有 MCP 工具注册进 ToolRegistry |
-
-还提供 `connect_all()` / `close_all()` 批量连接断开，上下文管理器支持 `with MCPRegistry() as reg: ...`。
-
----
-
-## 四、5 分钟上手：接入第一个 MCP Server
-
-### 4.1 最快的方式：用示例 echo server 验证
-
-我给你写了一个零依赖的示例 MCP server（`examples/mcp/echo_server.py`），它只实现两个工具：`echo`（回显）和 `calculate`（安全计算）。不需要装任何东西，直接跑：
-
-```python
-from pathlib import Path
-from fast_agents import ReActAgent
-from fast_agents.mcp import MCPRegistry
-
-# 1. 建注册表，加一个 stdio 类型的 MCP server
 mcp = MCPRegistry()
-server_path = Path("examples/mcp/echo_server.py").resolve()
-mcp.add_stdio("demo", "python", [str(server_path)])
+# 启动本地 echo demo（零依赖，验证用）
+mcp.add_stdio_cmd("demo", f'"{sys.executable}" "examples/mcp/echo_server.py"')
+# 生产可换成官方 server：
+# mcp.add_stdio("fs", "uvx", ["mcp-server-filesystem", r"D:\00sheepy"])
+# mcp.add_sse("remote", "https://your-host/mcp")
 
-# 2. 建 Agent（enable_skills=False 排除干扰，方便看 MCP 效果）
-agent = ReActAgent(name="助手", enable_memory=False, enable_skills=False)
+agent = ReActAgent(name="助手", llm=llm, enable_memory=True, enable_skills=True)
+agent.add_tool(builtin.CalculatorTool())
 
-# 3. 连接并注册（推荐方式二：register_into 展开成独立工具）
 mcp.connect_all()
-mcp.register_into(agent.tool_registry, prefix_sep="__")
+mcp.register_into(agent.tool_registry)           # 细粒度展开（推荐）
+agent.refresh_system_prompt()
 
-# 4. 看看工具列表，应该有 demo__echo 和 demo__calculate
-print("已注册工具:", agent.tool_registry.list_names())
+# 【可选】让模型能在运行时自己管理 MCP 连接：
+for t in build_mcp_tools(mcp, agent.tool_registry, refresh_prompt=agent.refresh_system_prompt):
+    agent.add_tool(t)
+agent.refresh_system_prompt()
 
-# 5. 跑起来
-agent.run("帮我算一下 (12+8)*3^2 等于多少，然后用 echo 工具把结果回显三遍")
-
-# 6. 退出时断开所有 MCP 连接
+print(agent.run("帮我算 3*4+1"))
 mcp.close_all()
 ```
 
-### 4.2 接真实的公开 MCP Server
+---
 
-MCP 生态里最常用的几个公开 server：
+## 四、Windows 专项
 
-| Server | 安装命令 | 提供的工具 |
-|--------|---------|-----------|
-| filesystem | `pip install mcp-server-filesystem` 或 `uvx mcp-server-filesystem` | read_file / write_file / list_directory / search_files / ... |
-| fetch | `uvx mcp-server-fetch` | fetch_url（抓取网页内容转 markdown） |
-| brave-search | `uvx mcp-server-brave-search`（需 API key） | web 搜索 |
-| sqlite | `uvx mcp-server-sqlite` | 执行 SQL 查询 |
-| github | `uvx mcp-server-github`（需 token） | 操作 GitHub issue/PR/文件 |
-
-接 filesystem server 的代码（Windows）：
-
-```python
-from fast_agents import ReActAgent
-from fast_agents.mcp import MCPRegistry
-
-mcp = MCPRegistry()
-# 给 filesystem server 传一个允许访问的根目录（Windows 路径）
-mcp.add_stdio(
-    "fs",
-    "uvx",
-    ["mcp-server-filesystem", "D:\\00sheepy\\01code"],
-)
-
-agent = ReActAgent(name="助手", enable_memory=False, enable_skills=False)
-mcp.connect_all()
-mcp.register_into(agent.tool_registry)
-print("已注册工具:", agent.tool_registry.list_names())
-
-agent.run("帮我看看 D:\\00sheepy\\01code 目录下有哪些 Python 项目")
-mcp.close_all()
-```
-
-> 如果没有 `uv`，用 `pip install uv` 装一下（和 `pip` 一样的 Python 包管理器，但启动 CLI 工具更方便，不用关心脚本在不在 PATH）。也可以用 `npx -y @modelcontextprotocol/server-filesystem ...`（需要 Node.js）。
-
-### 4.3 接远程 SSE 服务
-
-```python
-mcp.add_sse("weather", "http://localhost:8001")
-mcp.connect_all()
-mcp.register_into(agent.tool_registry)
-```
-
-SSE 连接会自动处理 endpoint 事件、session 管理。需要装 requests：`pip install requests`。
-
-### 4.4 方式一：用你 add_tool 已有的 auto_expand 钩子（零改动）
-
-如果你想用原来那段 auto_expand 逻辑（所有 MCP 工具参数打成 input_text），也可以，更简洁：
-
-```python
-from fast_agents import ReActAgent
-from fast_agents.mcp import MCPRegistry
-
-mcp = MCPRegistry()
-mcp.add_stdio("demo", "python", [str(server_path)])
-mcp.connect_all()
-
-agent = ReActAgent(name="助手", enable_memory=False, enable_skills=False)
-for srv_tool in mcp.get_server_tools():
-    agent.add_tool(srv_tool)   # 自动检测到 auto_expand=True，展开成 demo_echo / demo_calculate
-
-agent.run("...")
-mcp.close_all()
-```
-
-### 4.5 不用 Registry，直接用单个 MCPClient
-
-如果只接一个 server 或者要精细控制：
-
-```python
-from fast_agents.mcp import MCPClient, MCPToolAdapter
-
-client = MCPClient.from_stdio("python", ["server.py"], name="myserver")
-client.connect()
-print("工具:", [t.name for t in client.list_tools()])
-
-# 直接调用
-r = client.call_tool("echo", {"message": "hi"})
-print(r.to_text())
-
-# 或者包装成适配器注册
-from fast_agents import global_registry
-for info in client.list_tools():
-    global_registry.register_tool(MCPToolAdapter(client, info, prefix="myserver"))
-```
+1. **路径空格**：用 `add_stdio_cmd(name, command_str)` 传整段命令字符串（如 `"python" "D:/my dir/server.py" "arg with space"`），内部会用 `shlex.split(command_str, posix=False)` 按 Windows 规则拆。避免直接在命令行/字符串里裸拼含空格的路径。
+2. **防黑框**：启动子进程用了 `CREATE_NO_WINDOW`（0x08000000），不会弹出黑色命令行窗口。
+3. **编码**：子进程强制注入 `PYTHONIOENCODING=utf-8` / `PYTHONUTF8=1`，并在 stderr 读取时 `errors="replace"`，避免 GBK 控制台导致的乱码。
+4. **SSE 依赖**：`SSETransport` 只有用到时才会 import `requests`，没装会给清晰报错 `pip install requests`；stdio 模式零依赖。
 
 ---
 
-## 五、Windows 专项避坑
+## 五、写一个自己的 MCP Server（零依赖模板）
 
-1. **Python 命令用 `python` 不要用 `python3`**：Windows 官方安装器只注册 `python.exe`，`python3` 不存在会报 FileNotFoundError。
-2. **路径用正斜杠或双反斜杠**：Python 字符串里 `"D:\\data"` 或者 `r"D:\data"`，不要写单反斜杠。
-3. **uvx / npx 找不到命令**：
-   - `pip install uv` 安装 uv（会把 `uvx.exe` 装到 Scripts 目录下）；
-   - 或者 `npm install -g npx` 装 Node 版；
-   - 如果刚装完命令还找不到，重启一下终端让 PATH 生效。
-4. **子进程弹黑框**：本模块已经加了 `CREATE_NO_WINDOW`，正常情况下不会弹。如果你自己写 MCP server 用 `subprocess` 启动别的进程，记得也加这个标志。
-5. **中文乱码**：本模块已经强制 `PYTHONIOENCODING=utf-8`。如果你自己写 server，记得 `print(..., flush=True)`，并且在文件开头别加 `# -*- coding: gbk -*-` 这种奇怪的声明。
-6. **uvx 启动慢**：第一次跑 `uvx mcp-server-xxx` 会下载包，耐心等几秒；之后会缓存，启动很快。
-
----
-
-## 六、自己写一个 MCP Server（以 Python 为例）
-
-MCP server 只要满足三个条件就可以：
-1. 启动后从 stdin 按行读 JSON-RPC 消息；
-2. 向 stdout 写 JSON-RPC 响应（每行一条）；
-3. 实现 `initialize`、`tools/list`、`tools/call` 三个方法。
-
-最小模板（参考 `examples/mcp/echo_server.py`）：
+新建 `my_server.py`：
 
 ```python
-import json, sys
+import json, sys, math
 
-TOOLS = [
-    {
-        "name": "my_tool",
-        "description": "工具描述（写给模型看的，要写清楚什么时候用、参数什么意思）",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "查询关键词"},
-                "limit": {"type": "integer", "description": "返回条数，默认5", "default": 5},
-            },
-            "required": ["query"],
-        },
-    }
-]
+def _send(msg): sys.stdout.write(json.dumps(msg, ensure_ascii=False) + "\n"); sys.stdout.flush()
+def _recv():
+    line = sys.stdin.readline()
+    return json.loads(line) if line else None
 
-def handle(msg):
-    method, mid, params = msg.get("method"), msg.get("id"), msg.get("params", {})
-    if method == "initialize":
-        return {"jsonrpc": "2.0", "id": mid, "result": {
-            "protocolVersion": "2024-11-05",
-            "capabilities": {"tools": {}},
-            "serverInfo": {"name": "my-server", "version": "0.1.0"},
-        }}
-    if method == "tools/list":
-        return {"jsonrpc": "2.0", "id": mid, "result": {"tools": TOOLS}}
-    if method == "tools/call":
-        name = params["name"]
-        args = params.get("arguments", {})
-        if name == "my_tool":
-            text = f"收到查询: {args.get('query')}, limit={args.get('limit', 5)}"
-            return {"jsonrpc": "2.0", "id": mid, "result": {
-                "content": [{"type": "text", "text": text}], "isError": False,
-            }}
-        return {"jsonrpc": "2.0", "id": mid, "result": {
-            "content": [{"type": "text", "text": f"未知工具: {name}"}], "isError": True,
-        }}
-    # 通知（无 id）如 initialized 忽略即可
-    if mid is None:
-        return None
-    return {"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": f"未实现: {method}"}}
+TOOLS = [{
+    "name": "square",
+    "description": "计算一个数的平方",
+    "inputSchema": {
+        "type": "object",
+        "properties": {"x": {"type": "number", "description": "要平方的数"}},
+        "required": ["x"],
+    },
+}]
 
 def main():
-    if hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(encoding="utf-8")
-    for line in sys.stdin:
-        line = line.strip()
-        if not line: continue
-        try:
-            msg = json.loads(line)
-        except: continue
-        resp = handle(msg)
-        if resp is not None:
-            print(json.dumps(resp, ensure_ascii=False), flush=True)
+    while True:
+        msg = _recv()
+        if msg is None: break
+        mid, method = msg.get("id"), msg.get("method", "")
+        if method == "initialize":
+            _send({"jsonrpc": "2.0", "id": mid, "result": {
+                "protocolVersion": "2024-11-05",
+                "serverInfo": {"name": "my-server", "version": "0.1.0"},
+                "capabilities": {"tools": {}},
+            }})
+        elif method == "notifications/initialized":
+            pass
+        elif method == "tools/list":
+            _send({"jsonrpc": "2.0", "id": mid, "result": {"tools": TOOLS}})
+        elif method == "tools/call":
+            name = msg["params"]["name"]
+            args = msg["params"].get("arguments", {})
+            if name == "square":
+                x = float(args["x"])
+                _send({"jsonrpc": "2.0", "id": mid, "result": {
+                    "content": [{"type": "text", "text": f"{x}² = {x*x}"}],
+                    "isError": False,
+                }})
+            else:
+                _send({"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": f"Unknown {name}"}})
+        elif mid is not None:
+            _send({"jsonrpc": "2.0", "id": mid, "result": {}})  # ping 等
 
 if __name__ == "__main__":
     main()
 ```
 
-**写 MCP server 的关键**：
-- **description 要写给模型看**，不是写给人看的。要写清楚「什么时候用」「什么时候不该用」「每个参数的含义和取值范围」，这直接决定模型会不会调对；
-- **错误要走 `isError: true` 而不是 JSON-RPC error**：JSON-RPC error 表示协议层错误（方法不存在、参数格式错），工具业务错误（数据找不到、权限不够）应该在 result 里返回并设 `isError: true`；
-- **stdout 只能输出 JSON**：任何 print 调试信息必须打到 stderr（`print(..., file=sys.stderr)`），否则客户端会把你的调试日志当成协议消息解析失败；
-- **记得 flush**：`print(..., flush=True)`，不然消息可能缓冲在管道里客户端收不到。
+接入：
 
----
-
-## 七、测试验收清单
-
-我写了 `test/test_mcp.py`，9 项测试覆盖了从模型到端到端的全部链路，在你的 Windows 机器上可以直接跑：
-
-```powershell
-cd D:\00sheepy\01code\02alg_code_bjb\agent\fast_agents
-python test\test_mcp.py
-```
-
-测试覆盖：
-1. 数据模型序列化
-2. JSON Schema → pydantic 动态模型（字段类型/默认值/required/enum）
-3. stdio 连接 + initialize 握手 + tools/list
-4. call_tool 正常调用（echo 重复、calculate 四则运算 + 幂运算）
-5. 调用不存在的工具抛 MCPCallError
-6. 启动不存在的命令抛 MCPConnectionError
-7. MCPToolAdapter 细粒度适配器 invoke
-8. MCPServerTool auto_expand 属性和 `_available_tools` / list_tools / call_tool action
-9. MCPRegistry.register_into 批量注册到 ToolRegistry 并正常 invoke
-10. MCPToolAdapter 导出 OpenAI function schema
-
-```
-✅ 数据模型测试通过
-✅ JSON Schema 转 pydantic 通过
-✅ stdio 客户端连接 + 调用通过
-✅ 错误处理通过
-✅ 启动失败错误处理通过
-✅ MCPToolAdapter 通过
-✅ MCPServerTool (auto_expand) 通过
-🔌 MCP 'myserver' 已连接，发现 2 个工具
-✅ MCPRegistry.register_into 通过
-✅ 多 provider schema 导出通过
-
-==================================================
-MCP 测试结果: 9/9 通过
+```python
+mcp.add_stdio_cmd("my", f'"{sys.executable}" "my_server.py"')
+mcp.connect_all()
+mcp.register_into(agent.tool_registry)
+# 模型就能调用 my__square(x=5) → 25
 ```
 
 ---
 
-## 八、高级话题（目前没实现，后续可以扩展）
+## 六、API 速查
 
-| 能力 | 状态 | 说明 |
-|------|------|------|
-| Tools 调用 | ✅ 已实现 | 完整链路，最核心能力 |
-| Resources 读取 | 🟡 接口已预留 | `MCPClient.read_resource()` 已写，MCPToolAdapter 还没包装（因为 resources 是 pull 模式不是工具调用，需要另一种抽象） |
-| Prompts 模板 | 🟡 接口已预留 | `list_prompts()` 可用，但没暴露成工具 |
-| tools/list_changed 通知 | ⏳ 未实现 | 服务器动态增减工具时客户端自动刷新；目前只读一次 |
-| Sampling（让 MCP server 反过来调用 LLM） | ❌ 暂不做 | 这个要客户端暴露 LLM 能力给 server，安全风险大，等稳定了再加 |
-| Roots（客户端声明允许访问的 URI 根） | ❌ 暂不做 | filesystem 这类 server 用命令行参数传目录就行 |
-| Streamable HTTP（MCP 新传输） | ❌ 暂不做 | stdio + SSE 已覆盖 99% 场景，等协议稳定再加 |
-| 异步客户端 | ❌ 暂不做 | 你的 Agent 主循环是同步的，等你哪天要 async 再补 |
+### MCPRegistry
 
----
+| 方法 | 说明 |
+|---|---|
+| `add_stdio(name, command, args, env=None, cwd=None)` | 注册 stdio server |
+| `add_stdio_cmd(name, command_str)` | 注册 stdio server，传整段命令字符串 |
+| `add_sse(name, url, headers=None, timeout=30)` | 注册 SSE server |
+| `connect(name, timeout=10)` | 连接单个 server，返回 `MCPClient` |
+| `connect_all(timeout=10)` | 批量连接 |
+| `register_into(registry, prefix_sep="__", expand=True)` | 把工具展开到 ToolRegistry |
+| `close(name)` / `close_all()` | 断开 |
+| `list_tools(server=None)` | 查询已发现的工具 |
 
-## 九、常见问题排查
+### MCPClient
 
-**Q: `FileNotFoundError: 找不到可执行文件 'uvx'`**
-A: 装 uv：`pip install uv`，或者换成 `npx -y @modelcontextprotocol/server-xxx`（装 Node.js）。
+| 方法 | 说明 |
+|---|---|
+| `connect(timeout=10)` → `InitializeResult` | 握手（initialize + initialized 通知） |
+| `list_tools(timeout=10)` → `List[ToolInfo]` | 列工具 |
+| `call_tool(name, arguments, timeout=60)` → `CallResult` | 调用工具；`CallResult.as_text()` 拿拼接后的文本 |
+| `close()` | 关闭 |
 
-**Q: 连接后 `list_tools()` 返回空列表**
-A: 可能是子进程启动后立刻崩溃了。用 `client.transport.get_stderr()` 拿到 stderr 输出看错误；常见原因：Python 版本不兼容、缺依赖、命令参数写错。
+### builtin 管理工具（`fast_agents.tools.builtin.mcp_tool`）
 
-**Q: 模型调用 MCP 工具时总是参数错**
-A: 用方式二（`register_into` / `MCPToolAdapter`）而不是方式一（auto_expand），方式二导出的 schema 每个字段都有 description，模型不容易错。
+| 工具名 | 作用 |
+|---|---|
+| `list_mcp_servers` | 查看已连接的 MCP server 及其工具 |
+| `connect_mcp_server` | 运行时用命令串/SSE URL 动态连一个新 server |
+| `disconnect_mcp_server` | 断开并从 ToolRegistry 中移除相关工具 |
 
-**Q: `等待 MCP 响应超时（30s）`**
-A: 工具执行时间长的话，在创建 MCPClient 时把 timeout 调大：`MCPClient(transport, timeout=120)`；或者在 MCPRegistry.add_stdio 之后 `reg.get("name").timeout = 120`。
-
-**Q: 子进程关闭不彻底，端口被占用**
-A: 程序退出时记得调 `mcp.close_all()` 或者用 `with MCPRegistry() as mcp:` 上下文管理器；SSE server 的话检查服务器端有没有正确关闭 /sse 长连接。
-
-**Q: 多个 Agent 能不能共用一个 MCPRegistry？**
-A: 可以，一个 MCPClient 维护一个连接，只要不跨线程并发调用就行（本实现是线程安全的请求/响应配对，但多线程同时 call_tool 会排队发送，建议每个 Agent 独立 registry）。
-
----
-
-## 十、文件清单
-
-本次交付新增的文件（**不修改任何你已有的业务逻辑**，只在 `fast_agents/__init__.py` 加了导出）：
-
-```
-fast_agents/mcp/
-├── __init__.py
-├── errors.py
-├── models.py
-├── transports.py
-├── client.py
-├── registry.py
-└── tool.py
-
-examples/mcp/
-├── echo_server.py            # 零依赖示例 MCP 服务器（echo + calculate）
-└── mcp_quickstart.py         # 快速使用示例
-
-test/
-└── test_mcp.py               # MCP 模块单元测试（9 项）
-```
-
-修改的文件（只有一处）：
-- `fast_agents/__init__.py`：在 `__all__` 和顶层 import 里加了 MCP 相关符号的导出，不影响原有导入路径。
+工厂：`build_mcp_tools(registry, tool_registry, refresh_prompt=agent.refresh_system_prompt)`。
 
 ---
 
-## 验证步骤（Windows PowerShell）
+## 七、源码逐文件导读
 
-```powershell
-cd D:\00sheepy\01code\02alg_code_bjb\agent\fast_agents
+### 1. `errors.py`
+三层异常，方便上层按粒度 catch：连接层（进程启动失败/握手超时）、协议层（消息不符合 JSON-RPC）、业务层（远端工具报错）。
 
-# 1. 跑 MCP 测试
-python test\test_mcp.py
+### 2. `models.py`
+纯 pydantic 数据类，无逻辑。注意 `ToolInfo.has_structured_input`——如果远端 tool 的 schema 只有一个 `input` 字段，我们就认为它是单入参"伪结构化"工具，`MCPToolAdapter` 会回退到单字符串参数。
 
-# 2. 跑快速示例
-$env:PYTHONPATH="."
-python examples\mcp\mcp_quickstart.py
+### 3. `transports.py`
+- `Transport` ABC 定义 `connect/send/recv/close` 四个方法；
+- `StdioTransport`：子进程 + 后台读线程，按 `\n` 拆帧进队列；Windows 用 `CREATE_NO_WINDOW` + UTF-8 环境变量；
+- `SSETransport`：用 `requests` 流式读 SSE，解析 `event:`/`data:` 帧；先收 `endpoint` 事件拿到 POST URL，后续 send 走 HTTP POST；
+- `make_stdio(command_str)`：便捷工厂，自动判断 `posix=False` 适配 Windows。
 
-# 3. （可选）跑原有测试确认没破坏
-python test\test_tools.py
-python test\test_react_agent.py
-```
+### 4. `client.py`
+核心 RPC 逻辑：`_next_id()` 生成递增 id；`_request()` 发消息→轮询 `_request_id_to_response` 字典等响应；`_read_loop` 后台线程把 `id` 对应的响应塞回字典，遇到 server 主动发的方法请求返回 `-32601 Method not found`（合规但极简）。
 
-全部通过后，你就可以把 MCP 用起来了：`uvx mcp-server-filesystem <目录>` 是最值得先试的一个——接入后 Agent 就能直接读你硬盘上的文件了。
+### 5. `registry.py`
+多 server 门面。`register_into(registry, expand=True)` 的细粒度路径会给每个远端 tool 构造 `MCPToolAdapter` 并注册到你的 ToolRegistry；`expand=False` 则构造一个 `MCPServerTool`。工具名用 `<server><sep><tool>`（默认 `__`）避免冲突。
+
+### 6. `tool.py`
+- `_schema_to_pydantic(schema)`：把 JSON Schema 转成 pydantic 模型（支持 type/array/object/string/integer/number/boolean/enum/default/required）——这是细粒度能准确展开多参数工具的关键；
+- `MCPToolAdapter`：单工具适配器，`run(**kwargs)` 直接把 kwargs 当 arguments 传给远端；
+- `MCPServerTool`：聚合工具，暴露 `auto_expand=True` 和 `_available_tools` 属性，兼容你 `react_agent.py` 已有的钩子；`run` 接收 `{"action": "list_tools"}` 或 `{"action": "call_tool", "tool_name":, "arguments":}` 两种 payload。
+
+### 7. `fast_agents/tools/builtin/mcp_tool.py`
+完全对齐 `memory_tool.py` 的风格（三工具 + 工厂函数 + `ToolBase` 子类 + pydantic Input），注入 MCPRegistry 和 ToolRegistry 就能工作，不耦合 ReActAgent——通过 `refresh_prompt` 回调通知 prompt 刷新。
+
+---
+
+## 八、测试
+
+`test/test_mcp.py` 共 9 项，覆盖：
+1. 握手与工具发现
+2. echo/calculate 工具调用
+3. 不存在工具抛 MCPCallError
+4. MCPToolAdapter args_schema 生成（多参数、required/default）
+5. MCPServerTool auto_expand 兼容
+6. MCPRegistry 批量展开到 ToolRegistry
+7. builtin list 工具
+8. builtin connect/disconnect 动态链路（真启动子进程再断开）
+9. OpenAI/Anthropic schema 导出
+
+运行：`python test/test_mcp.py`
+
+---
+
+## 九、扩展路线（暂未实现，需要时再加）
+
+- **资源（resources）**：MCP 还定义了 `resources/list`/`resources/read`，可做成 `read_mcp_resource` builtin 工具；
+- **提示模板（prompts）**：`prompts/list`/`prompts/get`，用于从远端拉提示词模板；
+- **进度/日志**：`$/progress`、`logging/setLevel` 通知；
+- **tools/listChanged** 增量更新：当前每次 connect 全量 list，长连接场景可监听 `notifications/tools/list_changed` 自动重 list；
+- **采样回调（sampling/createMessage）**：允许 server 反向调用 LLM，需要在 `_read_loop` 里处理 server 发来的请求，涉及 LLM 回调注入，按需再加。
+
+---
+
+## 十、常见问题排查
+
+| 现象 | 原因 / 解决 |
+|---|---|
+| `找不到命令：uvx` | 没装 uv；先 `pip install uv` 或换成 `npx -y @modelcontextprotocol/server-xxx` |
+| Windows 弹出黑框 | 确认用的是本模块的 `StdioTransport`（已加 CREATE_NO_WINDOW）；如果你自己构造 subprocess 别忘了加 `creationflags=0x08000000` |
+| 中文乱码 | 已设 PYTHONIOENCODING=utf-8；若 server 自己强制用 GBK，在 `add_stdio(env={"PYTHONIOENCODING":"gbk"})` 覆盖 |
+| 工具被展开但模型总传错参数 | 大概率用了粗粒度模式（`expand=False`）；改成 `expand=True` 走细粒度，让模型看到完整 args_schema |
+| 工具名冲突 | 不同 server 都叫 `read_file` 时会变成 `fs__read_file` / `github__read_file`；想换分隔符传 `prefix_sep="_"` |
+| SSE 握手卡住 | 检查 URL 是否正确、是否需要 headers（如 Authorization）；服务端必须先 `event: endpoint` 再发 POST 地址 |
+| connect 超时 | 子进程没起来或没往 stdout 输出 JSON-RPC 消息；先直接命令行手动启动 server 看有没有报错 |

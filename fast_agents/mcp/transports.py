@@ -225,9 +225,9 @@ class SSETransport(Transport):
                 pass
 
 
-def make_stdio(command_str: str) -> StdioTransport:
+def make_stdio(command_str: str, cwd: Optional[str] = None) -> StdioTransport:
     """便捷工厂：把 'python server.py --arg x' 拆成命令+参数，Windows 用 posix=False。"""
     parts = shlex.split(command_str, posix=(sys.platform != "win32"))
     if not parts:
         raise MCPConnectionError("命令不能为空")
-    return StdioTransport(command=parts[0], args=parts[1:])
+    return StdioTransport(command=parts[0], args=parts[1:], cwd=cwd)

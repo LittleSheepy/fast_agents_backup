@@ -15,7 +15,7 @@
 from .errors import (
     MCPError, MCPConnectionError, MCPProtocolError, MCPCallError,
 )
-from .models import CallResult, InitializeResult, ServerCapabilities, ToolInfo
+from .models import CallResult, InitializeResult, ServerCapabilities, ToolInfo, MCPConfig
 from .transports import SSETransport, StdioTransport, Transport, make_stdio
 from .client import MCPClient
 from .registry import MCPRegistry
@@ -25,7 +25,7 @@ __all__ = [
     # errors
     "MCPError", "MCPConnectionError", "MCPProtocolError", "MCPCallError",
     # models
-    "CallResult", "InitializeResult", "ServerCapabilities", "ToolInfo",
+    "CallResult", "InitializeResult", "ServerCapabilities", "ToolInfo", "MCPConfig",
     # transports
     "Transport", "StdioTransport", "SSETransport", "make_stdio",
     # core

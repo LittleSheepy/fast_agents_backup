@@ -15,6 +15,7 @@ from .mcp import (
     MCPRegistry, MCPClient, MCPToolAdapter, MCPServerTool,
     MCPError, MCPConnectionError, MCPProtocolError, MCPCallError,
     StdioTransport, SSETransport, make_stdio,
+    MCPConfig,
 )
 
 __all__ = [
@@ -34,5 +35,5 @@ __all__ = [
     # MCP
     "MCPRegistry", "MCPClient", "MCPToolAdapter", "MCPServerTool",
     "MCPError", "MCPConnectionError", "MCPProtocolError", "MCPCallError",
-    "StdioTransport", "SSETransport", "make_stdio",
+    "StdioTransport", "SSETransport", "make_stdio", "MCPConfig",
 ]
