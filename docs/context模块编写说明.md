@@ -1,581 +1,771 @@
 # FastAgents context 模块编写说明
 
-本文档面向 fast_agents 的上下文工程系统，参考 **LangChain / LangGraph 的消息裁剪与 SummarizationNode**、**LlamaIndex 的 Context 构建与召回**、**CrewAI 的上下文传递**、**Anthropic 的 compaction 与 tool result 截断** 等框架的共性设计，给出新架构的完整说明、源码解析和自定义策略教程。
-> 面向 `fast_agents` 从「只有 tools / memory」扩展到「带上下文工程」的完整实现指南。
-> 本文档配套 `fast_agents/context/` 下的可运行代码，所有代码已实测通过。
+本文档面向 fast_agents 的**上下文工程（context engineering）**系统，参考 **LangChain 的 `trim_messages` 与 SummarizationNode**、**LlamaIndex 的 Context 构建与召回**、**CrewAI 的上下文传递**、**Anthropic 的 compaction 与 tool result 截断**、**DeepAgents 的「会话状态外化成文件」** 等框架的共性设计，给出本模块的完整说明、源码解析与自定义教程。
+
+> 版本：v1.0 · 2026-10-27 · 首次交付，落地《演进路线图》模块 F 的 F1–F3，铺好 F4 / F5 的地基
+> 适用版本：`fast_agents.context`（包内 `__version__ = "1.0.0"`）
+> 配套代码：`fast_agents/context/`（7 个文件）+ `examples/context/context_react_agent_demo.py`（5 个示例）+ `test/test_context.py`（16 项），均已实测通过
+> 运行环境：Python 3.10+，Windows / macOS / Linux；依赖：**零新增三方依赖**（只用标准库；`tiktoken` 为可选增强，未安装时自动降级为启发式估算）
+
+---
+
+## 目录
+
+- [一、更新历史](#一更新历史)
+- [二、先想清楚：context 解决什么问题](#二先想清楚context-解决什么问题)
+- [三、主流框架 context 实现对比](#三主流框架-context-实现对比)
+- [四、模块架构](#四模块架构)
+- [五、核心机制：五层拼装顺序与三级压缩策略](#五核心机制五层拼装顺序与三级压缩策略)
+- [六、核心数据模型](#六核心数据模型)
+- [七、逐个文件讲解](#七逐个文件讲解)
+- [八、快速上手](#八快速上手)
+- [九、API 速查](#九api-速查)
+- [十、设计决策与常见坑](#十设计决策与常见坑)
+- [十一、测试与验证](#十一测试与验证)
+- [十二、下一步演进路线](#十二下一步演进路线)
+- [十三、参考](#十三参考)
+- [附录：发布前自检清单](#附录发布前自检清单)
 
 ---
 
 ## 一、更新历史
 
-> **v1 更新摘要**（首次交付，落地路线图模块 F 的 F1–F5）
-> 1. **新增 `fast_agents/context/` 模块** —— 七个文件，覆盖 token 计数与预算（F1）、工具结果卸载（F2）、文件系统工具（F3）、可插拔压缩策略（F4）、缓存友好的分层拼装（F5）；
-> 2. **`ReActAgent` 接入 context** —— 新增 `ctx` / `enable_context` / `context_budget` / `context_offload_threshold` 四个构造参数，开启后每轮按 token 预算分层拼装上下文、超长工具结果自动卸载；
-> 3. **默认关闭** —— `enable_context` 默认 `False`，不改变既有行为；不传 `ctx` 时自动创建默认实例（当前工作目录 + 128k 窗口）；
-> 4. **修掉一处接入期的重复注入** —— 开启 context 后，本轮用户输入由 user 层承载，主循环里不再对同一输入二次 `append_user`（详见 3.4）；
-> 5. **零新增三方依赖** —— tiktoken 为**可选**依赖，没装时自动降级为启发式估算，`pyproject.toml` / `requirements.txt` 无需变动。
+| 版本 | 日期 | 变更 | 作者 |
+|------|------|------|------|
+| 1.0.0 | 2026-10-27 | 首次编写，逐行对齐 `fast_agents/context/` 真实实现；按《XX 模块编写说明》模版 v2.0 重排章节（开篇 → 一～十三 → 附录） | — |
 
-> **v2 预留摘要**（本版未实现的后续变更，先在此占位，避免下次改动忘记录入）
-> 1. 语义召回层（`ContextPacket.metadata` 已留位）；
-> 2. Prompt caching 断点显式化（`cache_control` 注入点已在 4.4 标注）；
-> 3. `SummarizationMiddleware` 中间件化。
+> **破坏性变更：无。** 模块是**纯新增**：新增 `fast_agents/context/` 目录、1 个示例、1 份测试；对既有文件的修改只有两处「追加式」改动——`fast_agents/__init__.py` 追加导出、`fast_agents/agents/react_agent/react_agent.py` 追加 4 个构造参数与 3 个内部方法。**默认开关全部关闭**（`enable_context=False`），不动既有行为，老代码不改一行也能跑。
 
----
+本次交付同时落地《演进路线图》**模块 F** 的四条任务：
 
-## 二、主流框架的 context 模块实现对比
-
-### 2.1 主流框架怎么做的
-
-上下文工程（context engineering）是近两年才被单独抽出来的一层。各家的叫法不同、边界不同，但**要解决的问题高度一致**：模型窗口有限，而 Agent 的历史、工具结果、文件内容会无界增长，必须有人负责「算账 + 取舍」。
-
-| 框架 | 核心抽象 | 计量方式 | 压缩/裁剪 | 工具结果处理 | 分层与顺序 | 本实现借鉴 |
-|---|---|---|---|---|---|---|
-| **LangChain** | `trim_messages` / `MessagesPlaceholder` | `get_num_tokens_from_messages`（tiktoken 包装） | `trim_messages`（按 token 或条数裁剪，可保留 system） | 无内建，靠工具自己截断 | 通过 prompt 模板的占位符手工控制 | **token 计数口径**、**裁剪时保留 system** |
-| **LangGraph** | State + `SummarizationNode` | 同 LangChain | SummarizationNode：超阈值就把老消息摘要化，保留最近 N 条 | 无内建 | 图节点决定，state 里存 messages | **「超阈值才摘要、保留最近 N 条」的触发式策略** |
-| **LlamaIndex** | `ContextBuilder` / `ChatEngine` | tokenizer 可选 | ChatMemory + 自动压缩 | `ToolOutput` 可截断 | 有 `ContextPack` 概念，把片段组装进 prompt | **「ContextBuilder 做门面、packet 参与预算排队」的思路** |
-| **CrewAI** | task context 传递 + 每任务独立上下文 | 无 | 无（把不同任务的上下文隔离来回避） | 无 | 按任务隔离，而非全局拼接 | **「压缩不是唯一解，隔离也是」的取舍意识** |
-| **Anthropic Claude** | 无框架，讲实践 | 官方 API 计 token | **compaction**：逼近窗口时把对话总结 + 重启新对话 | **tool result 截断 + 文件回读**（大结果外置到文件，模型按需读取） | 强调「静态在前、动态在后」以命中 prompt cache | **卸载 + 回读机制**、**缓存友好顺序** |
-| **DeepAgents** | 记忆即文件 + 上下文中间件 | 有 | 自动 compaction | 文件系统工具读写 | 会话状态外化成文件 | **文件系统作为上下文的「外部存储」** |
-
-### 2.2 本实现与主流的比较
-
-| 对比项 | 主流做法 | 本实现 | 差异说明 |
-|---|---|---|---|
-| **计数精度** | 强制依赖 tiktoken 或模型自带 tokenizer | tiktoken **可选**，缺失时启发式估算（CJK 1 字≈1 token、拉丁 4 字符≈1 token，再乘 1.15 安全系数） | 保持仓库「零重型依赖」原则；估算宁可多算不卡上限 |
-| **是否有预算概念** | 多数只有「窗口大小」 | 显式 `TokenBudget`：`窗口 - 预留输出 - 安全余量 = 可用预算` | 预留输出很关键，不预留会出现「请求成功但回答被截断」 |
-| **压缩策略** | 基本单一（trim 或 summarize） | **三级可插拔**：卸载 → 裁剪 → 摘要，逐级降级 | 优先选信息不丢的策略；摘要最慢也最易失真，放最后 |
-| **压缩单位** | 多数按「条数」丢 | 按**消息组（turn）**丢，`assistant(tool_calls)` 与 `tool` 结果绝不拆散 | 结构化消息协议的硬约束，拆散直接 400 |
-| **工具结果** | 多数靠工具自己截断（丢信息） | **卸载到磁盘 + `read_offloaded` 按需回读**（信息不丢） | 对齐 Anthropic / DeepAgents；也顺带把长任务状态落成文件 |
-| **分层** | 用 prompt 模板手工拼 | 显式 `ContextLayer` + `LAYER_ORDER`，每层带 `priority` / `required` | 把「拼装顺序」和「裁剪优先级」变成数据，而非散落在代码里 |
-| **管理方式** | 框架自动接管，用户难干预 | 自动拼装 **+ 一组工具让模型自己管理**（回读/读写文件） | 对齐记忆模块「自动 + 工具双路径」的成功经验 |
-| **依赖** | langchain / llama-index 等大包 | **零新增依赖**（标准库 `json` / `pathlib` / `uuid`） | 与 `tools` / `memory` 同风格 |
-| **暂未实现** | 语义召回、缓存断点显式化 | 预留 `metadata` 扩展位，本轮不做 | 先跑通闭环，接口留口子（见第七节） |
-
-**一句话总结取舍**：拿走了 LangChain/LangGraph 的「分层 + 触发式压缩」、Anthropic 的「卸载 + 回读 + 静态在前」、LlamaIndex 的「门面 + 包」，
-**丢掉了**重型的 Runnable 抽象、图编排、以及把压缩做成黑盒的自动接管模式；
-CrewAI 的「用隔离代替压缩」这条路线属于 `agents` 模块（子代理）的范畴，本轮不碰。
-
----
-
-## 三、模块架构
-
-### 3.1 目录结构
-
-```
-fast_agents/context/               ← 单数目录，对齐 tools/ memory/ skills/ mcp/
-├── __init__.py                    模块出口（只暴露三组概念 + 门面 + 工具）
-├── tokens.py                      计量：TokenCounter / TokenBudget / 估算函数
-├── layers.py                      分层：ContextLayer / ContextWindow / LAYER_ORDER
-├── offload.py                     卸载：ContextOffloader / OffloadRecord
-├── compressor.py                  治理：ContextCompressor 三级策略 / CompressionReport
-├── builder.py                     门面：ContextBuilder / BuildReport
-└── tools.py                       工具：read_offloaded + write/edit/list 四件套
-
-examples/context/
-└── context_react_agent_demo.py    5 个示例：分层 / 卸载 / 压缩 / 文件系统 / Agent 接入
-
-test/
-└── test_context.py                16 项单元测试（不依赖真实 LLM）
-```
-
-设计上完全对齐仓库既有架构约定：
-
-- **门面模式** —— `ContextBuilder` 对应 `MemoryManager`：对外只暴露少量动作，Agent 不需要知道底下分了哪些层、用哪种压缩策略；
-- **数据模型用 dataclass** —— `OffloadRecord` / `CompressionReport` / `BuildReport` 用 `@dataclass`，比 pydantic 更轻，因为它们是**内部日志结构**而非需要校验的输入；需要校验的输入（工具参数）仍然用 `pydantic BaseModel`，与 `ToolBase.args_schema` 一致；
-- **工具继承 `ToolBase`** —— `ReadOffloadedTool` / `WriteFileTool` / `EditFileTool` / `ListFilesTool` 全部走 `args_schema` + `param_model` 体系，因此 `build_openai_like_tool()`、`|` 运算符、`ToolRegistry` 注册、`ToolResult` 结构化返回**全部直接可用**；
-- **安全边界一致** —— 文件工具的路径沙箱思路与 `ReadFileTool` / `TerminalTool` 完全一致（`resolve()` 后 `relative_to(workspace)`，越界直接 `ToolResult.fail`，不做任何 IO）。
-
-### 3.2 数据流总览
-
-context 模块不自己存历史，它做的是**「在消息送进 LLM 之前，把各路来源拼装成一份带预算的上下文」**：
-
-```
-                        ┌───────────────────────────────────────────────┐
-                        │            ReActAgent.run() 每轮开始           │
-                        └───────────────────┬───────────────────────────┘
-                                            │
-        ┌───────────────────────────────────┼───────────────────────────────────┐
-        │                                   ▼                                   │
-        │                        ContextBuilder.build()                         │
-        │                                                                       │
-        │  L1 system   ← self.messages 里的 system（静态，required，缓存锚点）    │
-        │  L2 memory   ← memory.retrieve() 长期记忆 + buffer 摘要               │
-        │  L3 history  ← memory.buffer.get_messages()   【单一数据源】           │
-        │  L4 files    ← 文件片段 / 卸载回读内容                                  │
-        │  L5 user     ← 本轮问题（required，永远最后）                          │
-        │       │                                                               │
-        │       ▼  ContextWindow（按层序，带 priority / required）               │
-        │  TokenCounter 算账 → 超预算？                                          │
-        │       │                                                               │
-        │       ▼  ContextCompressor.compress()                                 │
-        │  ① 卸载 offload  →  ② 裁剪 trim（成组）  →  ③ 摘要 summarize           │
-        └───────────────────────────────────┬───────────────────────────────────┘
-                                            ▼
-                                   Messages → LLM
-                                            │
-                        工具返回超长结果 ────┘
-                                            ▼
-                              ContextBuilder.observe()
-                                            │
-                      ContextOffloader.offload()  → 落盘 + 只留引用文本
-                                            │
-                              模型需要全文 → read_offloaded 工具按 id/行区间回读
-```
-
-**四条清晰的边界**：
-
-- **context 不持有历史** —— L3 的历史永远来自 `memory.buffer`，「单一数据源」约定不被打破；
-- **context 不改记忆内容** —— 它只读 `memory.retrieve()` 的结果做渲染，不写回 `store`；
-- **context 不碰工具执行** —— 它只对「工具已经返回的结果」做卸载，`ToolRegistry` 的执行链路不受影响；
-- **卸载是可逆的** —— 落盘的是全文，上下文里留的是引用，信息不丢，只是从「常驻」变成「按需」。
-
-### 3.3 类关系
-
-```
-TokenCounter                          ← 计量：tiktoken 优先，缺失降级估算
-TokenBudget                           ← 预算：窗口 - 预留输出 - 安全余量
-
-ContextLayer                          ← 一层（name / messages / priority / required）
-ContextWindow                         ← 一组层（add_layer / flatten / validate）
-
-ContextOffloader                      ← 卸载：把超长文本写盘，返回引用；支持回读
-└── OffloadRecord                     ← 卸载元数据（id / tool_name / 长度 / 预览）
-
-ContextCompressor                     ← 治理：三级策略串联
-└── CompressionReport                 ← 压缩结果（卸载数 / 裁剪数 / 是否摘要 / token 前后）
-
-ContextBuilder (门面)                 ← 组合：window + counter + budget + offloader + compressor
-└── BuildReport                       ← 一次 build 的结果（分层统计 / 压缩报告 / 告警）
-
-ReadOffloadedTool / WriteFileTool / EditFileTool / ListFilesTool (ToolBase)
-build_context_tools()                 ← 工厂，按需组装
-
-ReActAgent                            ← _init_context / _fit_context / _offload_observation
-```
-
-### 3.4 ⭐ 接入 ReActAgent 时的两条边界
-
-这两处是「Context 模块」和「Agent 主循环」的接缝，最容易出问题，值得单独讲清。
-
-#### 边界一：本轮用户输入只能出现一次
-
-开启 context 后，本轮问题是由 **user 层**承载的（`ContextBuilder.build(user_input=...)` 会把它拼在最后）。
-而 `ReActAgent.run()` 的循环里本来就有一句「第 1 步追加用户输入」的历史逻辑：
-
-```python
-# 修复前：两条路径都会加，结果是 user 消息出现两次
-if current_step == 1:
-    self.messages.append_user(user_input)
-```
-
-`_fit_context()` 已经把 `user_input` 拼进工作区了，这里再追加一次，模型第一眼就会看到**两条一模一样的用户输入**——
-轻则浪费 token、让模型以为「用户说了两遍」而重复确认，重则诱导模型多做一轮无意义推理。
-
-修复方式是在追加前判一次「是否已由 context 承载」：
-
-```python
-# 修复后：开启 context 时，user 层已经放好了本轮问题，不再重复追加
-if current_step == 1 and not (self.enable_context and self.ctx is not None):
-    self.messages.append_user(user_input)
-```
-
-对应的回归断言写在 `test/test_react_agent.py`：
-
-```python
-def test_context_user_input_not_duplicated():
-    """多工具步场景下，user 输入也只注入一次（不随步数累积）"""
-    ...
-    for i, call in enumerate(llm.calls):
-        users = [m for m in call if m.get("role") == "user"]
-        assert len(users) == 1, f"第 {i + 1} 次调用 user 出现 {len(users)} 次"
-```
-
-#### 边界二：开启 context 时，记忆不再二次拼进 user
-
-`run()` 里原本的流程是「检索长期记忆 → 拼接到用户输入文本上 → 作为 user 消息发出去」：
-
-```python
-memory_text = self._retrieve_long_term_memory(input_text)
-user_input = self._merge_memory(input_text, memory_text)
-```
-
-context 打开后，长期记忆改由 **L2 memory 层**统一承载（`_collect_context_packets()` 收集），
-所以 `_fit_context()` 之后又把 `user_input` 还原成 `input_text`：
-
-```python
-if self.enable_context and self.ctx is not None:
-    self._fit_context(input_text)
-    user_input = input_text          # ← 长期记忆已在 memory 层，不再拼进 user
-```
-
-**为什么记忆层用 `role="user"` 而不是 `role="system"`**：记忆是**参考信息**而非**指令**。
-放进 system 等于把可能来自用户输入的不可信内容提升到系统指令级别（记忆投毒风险），
-这一点与 `记忆模块编写说明.md` 4.9 节的结论完全一致，两层模块用的是同一套注入安全原则：
-
-| 维度 | system | user（本实现的选择） |
+| 编号 | 任务 | 本次状态 |
 |---|---|---|
-| 语义权威 | 高，模型更服从 | 低，只作参考 |
-| 安全 | ⚠️ 不可信内容升格为指令 | ✅ 层级低，风险可控 |
-| 缓存 | 必须在末尾 | 位置灵活 |
+| **F1** | `TokenCounter` + 上下文预算 | ✅ 已实现（`tokens.py`，三级降级计数 + `TokenBudget`） |
+| **F2** | 工具结果卸载到磁盘 | ✅ 已实现（`offload.py` + `read_offloaded` 工具） |
+| **F3** | 文件系统工具（`ls` / `read` / `write` / `edit`） | ✅ 已实现（`tools.py` 三件套 + `read_offloaded`，`read` 复用既有 `ReadFileTool`） |
+| **F4** | 摘要 / 压缩中间件化 | 🟡 部分（三级策略已实现且可开关，但未包成通用中间件，见 [十二章](#十二下一步演进路线)） |
+| **F5** | Prompt caching 友好布局 | 🟡 部分（静态在前、动态在后的顺序已就位，未显式打缓存断点，见 [4.4](#44-与-reactagent-的接入点--职责边界)） |
 
-为了让模型不把记忆误当成用户刚说的话，memory 层的内容统一带一行前缀：
-
-```python
-Message("user", f"[参考记忆，非用户本轮发言]\n{memory_text}", ...)
-```
-
-#### 最终的工作区职责划分
-
-| | `self.messages`（工作区） | `memory.buffer`（跨轮历史） | `ContextBuilder.window`（本轮拼装窗口） |
-|---|---|---|---|
-| 定位 | 本次 run 的推理工作区 | 跨轮会话历史的唯一数据源 | 一次 build 产出的分层快照 |
-| 内容 | 分层拼装结果 + 本轮 tool 链 | 历轮 user/assistant（窗口 + 摘要） | system / memory / history / files / user |
-| 生命周期 | run 开始重建、结束即可丢弃 | 跨 run 长期存在 | 每次 `build()` 重建 |
-| 是否裁剪 | 不裁（已由 builder 裁过） | 滑动窗口 + 滚动摘要 | 按预算裁剪 + 压缩 |
-
-> **为什么不让 context 直接接管 `memory.buffer` 的裁剪？**
-> 因为 `buffer` 是「历史存储」，`window` 是「本次送模型的视图」，两者要解决的问题不同：
-> 同一条历史，在不同模型窗口（32k / 128k）下该留多少条是不一样的，这属于「视图」的事，不该写进「存储」。
+> **相对上一版文档的变化**：上一版 `docs/context模块编写说明.md` 用的是「更新历史 → 主流框架对比 → 模块架构 → 逐个文件讲解 → 上手 → 常见坑 → 演进路线 → 测试」的旧骨架（八节 + 附）。本版按模版 v2.0 重排为「开篇 → 一～十三 → 附录」，**章节数量、顺序、编号与 `docs/记忆模块编写说明.md` 等四份成品完全一致**，内容也补全了旧版缺失的「二、先想清楚」「六、核心数据模型」「九、API 速查」「附录：发布前自检清单」四块。**以本文为准。**
 
 ---
 
-## 四、逐个文件讲解
+## 二、先想清楚：context 解决什么问题
 
-### 4.1 `tokens.py` —— 计量：先知道有多少，才谈得上怎么裁
+### 2.1 一句话概括
 
-为什么必须先做这个（对应路线图 F1 的排序）？因为**「裁不裁」的前提是「知道有多少」**。
-`BufferMemory` 按「消息条数」裁剪，但一条消息可能 3 个 token，也可能是一整篇文档——
-只有把 token 数算出来，才能按**预算**而不是条数管理上下文。
+**context 模块负责「在把上下文送进模型之前，算清账、排好序、该砍就砍」。**
 
-#### TokenCounter：三级降级，零新增依赖
+它不存历史（那是 `memory` 的事）、不执行工具（那是 `tools` 的事）、不定义消息协议（那是 `messages` 的事）。它只做三件事，按顺序：
 
-```python
-class TokenCounter:
-    def __init__(self, model="gpt-4o-mini", use_tiktoken=True, safety_ratio=1.15):
-        self._encoder = self._load_encoder(model) if use_tiktoken else None
-        self.backend = "tiktoken" if self._encoder is not None else "heuristic"
+| 动作 | 文件 | 回答的问题 |
+|------|------|-----------|
+| **计量** | `tokens.py` | 这段上下文**有多少 token**？预算还剩多少？ |
+| **分层** | `layers.py` | 内容**该放在哪个位置**？超预算时**先砍谁**？ |
+| **治理** | `offload.py` / `compressor.py` | 超预算了**怎么办**？卸载？裁剪？还是摘要？ |
+
+三者拼起来，就是门面 `ContextBuilder` 的一次 `build()`。**没有魔法，全是账。**
+
+### 2.2 为什么不能只靠「buffer 按条数裁剪」
+
+模块存在之前，仓库里管上下文的东西有两处，但都**停在局部**：
+
+- `BufferMemory` 的滚动窗口按 **`max_messages`（消息条数）** 裁剪，配一个滚动摘要；
+- `ReActAgent._seed_workspace()` 每轮把 buffer 窗口搬进 `self.messages` 工作区。
+
+问题在三处：
+
+1. **「条数」不等于「代价」**。一条消息可能是 3 个 token（`"你好"`），也可能是一整篇 2 万字符的 `read_file` 结果。按条数裁，量大的一条就能把窗口顶爆，而裁掉十条短消息几乎不省 token；
+2. **窗口满了没人报警**。没有 token 计数，就不会有「超预算」这个信号，压缩也就无从触发；
+3. **大结果无法回收，也无处安放**。一次 `web_search` 返回 5 万字符，塞进 `tool` 消息后，后面十轮都带着它，而其中九轮根本不再看它。
+
+所以 context 的第一条设计原则是：**「裁不裁」的前提是「知道有多少」。** 先有 `TokenCounter`，才谈得上后面的一切。
+
+### 2.3 设计原则
+
+整个模块围绕四条原则展开，后面每一处实现都能回指到其中某一条：
+
+1. **零重型依赖**。与 `memory`（只用 `sqlite3` / `json` / `pathlib`）、`mcp`（自实现 JSON-RPC）一致，context **不做任何硬依赖**：token 计数用 `tiktoken`，**没装就自动降级为启发式估算**；卸载用 `json` + `pathlib`，不引数据库。「装得上、跑得起」优先于「算得准」。
+2. **零侵入既有模块**。context **不改 `memory` / `tools` / `messages` 的任何一行**，只从它们的公开接口取数据（`buffer.get_messages()` / `memory.retrieve()` / `ToolResult.output`）。这样即使关掉 context，仓库行为与之前**逐字节一致**。
+3. **信息不丢优先于信息变短**。压缩有三条路：**卸载**（丢体积、不丢信息）→ **裁剪**（丢最老的、最不可逆）→ **摘要**（有损、还要多花一次 LLM 调用）。所以顺序固定，把最贵、最不可逆的放最后。
+4. **静态在前、动态在后**。拼装顺序不是审美偏好，而是 **prompt caching** 的硬要求：缓存按「前缀匹配」，从请求开头到缓存断点必须逐 token 一致；一旦每轮都在变的记忆被塞进 system 中段，后面全部缓存失效，长会话成本直接翻倍。
+
+### 2.4 概念分层
+
+「上下文」在不同语境里指不同东西。本模块把最顶层拆成五层，各层的数据来源与生命周期如下：
+
+| 层 | 名字 | 数据来源 | 生命周期 | 变化频率 | 典型内容 | 本框架对应 |
+|---|---|---|---|---|---|---|
+| **L1** | system | `ReActAgent` 构造时生成 | 整个 Agent 生命周期 | 极低（仅加载技能时刷新） | 身份设定、工具清单、技能索引 | `self.system_prompt_template` |
+| **L2** | memory | `memory.retrieve()` + `buffer.get_summary()` | 跨轮 | 低 | 长期记忆、会话摘要 | `MemoryManager` |
+| **L3** | history | `buffer.get_messages()` | 跨轮，滚动 | 高（每轮增长） | 历轮 user / assistant | `BufferMemory.buffer` |
+| **L4** | files | 按需注入 / 卸载回读 | 单轮 | 高 | 文件片段、卸载结果 | `ContextOffloader` |
+| **L5** | user | `run()` 入参 | 单轮 | — | 本轮问题 | 调用方 |
+
+> 一句话记忆法：**L1 身份、L2 事实、L3 对话、L4 素材、L5 问题**。前两层相对稳，后三层每轮都在动——所以裁剪的手先伸向 L3。
+
+---
+
+## 三、主流框架 context 实现对比
+
+### 3.1 对比总表
+
+上下文工程是近两年才被单独抽出来的一层。各家叫法不同、边界不同，但要解决的问题高度一致：**窗口有限，而历史、工具结果、文件内容会无界增长，必须有人负责「算账 + 取舍」。**
+
+| 框架 | 核心抽象 | 计量方式 | 压缩 / 裁剪 | 工具结果处理 | 分层与顺序 | 依赖 |
+|---|---|---|---|---|---|---|
+| **LangChain** | `trim_messages` / `MessagesPlaceholder` | `get_num_tokens_from_messages`（包 tiktoken） | `trim_messages`（按 token 值裁剪）+ `SummaryBufferMemory` | `trim_messages` 可保留最近 N 条含 tool 的组 | 由调用方手工排列，无强制层序 | 重（`langchain-core`） |
+| **LangGraph** | `StateGraph` + `SummarizationNode` / Checkpointer | 同上 | 图节点里做「裁剪 + 摘要」，摘要写回 state | 消息列表整体作为 state 处理 | state 即上下文，顺序即写入顺序 | 重（依赖 LangChain 全家桶） |
+| **LlamaIndex** | `ChatMemoryBuffer` + `Context` / Node 召回 | tokenizer 可插拔 | 超出 `token_limit` 时按「最近优先」截断 | 检索到的 Node 作为上下文注入 | 检索结果拼进 system / 用户消息 | 中（`llama-index-core`） |
+| **CrewAI** | Task / Agent 上下文传递 | 弱（主要靠上下文隔离） | 靠「子 Agent 各持独立上下文」降低压力 | 工具输出进 Agent 自己的上下文 | 无明显分层，靠隔离 | 中 |
+| **Anthropic（Claude）** | Compaction + Tool result 截断 | 官方 token 计数 API | **自动 compaction**（超阈值改写历史）+ 手工 `/compact` | tool result 超长截断，可落文件后回读 | 官方建议：稳定内容在前、可变内容在后 | 无（服务端能力） |
+| **DeepAgents（LangChain）** | 会话状态外化成文件 + 记忆即工具 | tiktoken | 上下文压缩 + 文件系统 | 大结果写文件，工具按需回读 | 文件为「外部记忆」，按需回读 | 重 |
+| **本实现（fast_agents.context）** | `ContextBuilder` 门面 + `ContextWindow` 分层 | `TokenCounter` 三级降级（tiktoken → 通用编码 → 启发式） | **三级策略：卸载 → 裁剪 → 摘要**，可逐项开关 | 超长结果落盘，`read_offloaded` 按行区间回读 | **强制五层顺序**（system → memory → history → files → user） | **零**（只用标准库） |
+
+### 3.2 关键差异
+
+| 维度 | 相同 | 本实现**增加** | 本实现**缺少** |
+|---|---|---|---|
+| **计量** | 都要先算 token 才谈裁剪 | 三级降级：没装 tiktoken 也能跑，且中文按 CJK 单独处理（1 字≈1 token） | 无精确的、与 provider 对齐的 tokenizer（Claude 用官方 API 计数，本实现是估算） |
+| **压缩** | 都支持「裁剪 + 摘要」 | **把「卸载」提到裁剪之前**——先丢体积、再丢信息，最后才有损摘要 | 未做成 LangGraph 那样的「图节点 / 中间件」，仍是构造函数里的方法调用 |
+| **工具结果** | 都意识到 tool result 是爆窗主因 | 卸载是**透明**的：`observe()` 未超阈值时零 IO，主循环可以无脑调用 | 未做流式截断（对已在流中的超长输出无能为力） |
+| **分层顺序** | 都认同「静态在前」 | 把顺序做成**数据**（`LAYER_ORDER` 常量），因此裁剪器不需要知道谁是 system | 未显式打 cache 断点（没有 `cache_control` 注入点），只把位置留好了 |
+| **与记忆的关系** | 都把记忆视作上下文的一部分 | 明确**两条路**：history 只走 buffer、memory 只走检索+摘要，从结构上杜绝重复注入 | 未实现向量召回（预留 `metadata` 扩展位，对齐路线图 B2） |
+| **隔离** | CrewAI 用子代理隔离上下文 | —— | 无 sub-agent 隔离（属 `agents` 模块 E3，不在本模块范围） |
+| **生态** | 都能与既有工具链协作 | 与 `tools` 的 `ToolResult` 协议、`skills` 的中间件顺序**原生对齐** | 没有跨框架的 serializer / 回调体系 |
+
+**缺少项对应的待办**：tokenizer 精度 → 路线图 F1 延伸；压缩中间件化 → **F4**；缓存断点 → **F5**；语义召回 → **B2**；子代理隔离 → **E3**。详见[第十二章](#十二下一步演进路线)。
+
+### 3.3 一句话收口
+
+**本实现 = LangChain 的「分层 + 可插拔压缩」思路 + Anthropic 的「tool result 截断 + 文件回读」机制 + DeepAgents 的「会话状态外化成文件」实践 − 它们的全部重型依赖 − 它们的黑盒。**
+
+拿走的都是思路，丢掉的是依赖和不可控。代价是功能面窄（没有图编排、没有向量召回），但换来的是**每行都能读懂、随时能改**——这正是 `fast_agents` 这个仓库的定位。
+
+---
+
+## 四、模块架构
+
+### 4.1 目录结构
+
+```text
+fast_agents/context/          ← 单数目录，对齐 tools/ memory/ skills/ mcp/
+├── __init__.py               模块出口：统一导出「计量 / 分层 / 治理」三组符号
+├── tokens.py                 计量：TokenCounter（三级降级）+ TokenBudget + 估算函数
+├── layers.py                 分层：ContextLayer / ContextWindow / LAYER_ORDER
+├── offload.py                治理·卸载：ContextOffloader（大结果落盘 + 按需回读）
+├── compressor.py             治理·压缩：ContextCompressor（三级策略）+ CompressionReport
+├── builder.py                门面：ContextBuilder（拼装 + 预算 + 压缩一键走完）
+└── tools.py                  工具：read_offloaded + write/edit/list 三件套 + 工厂
 ```
 
-降级链是 **tiktoken → 通用 cl100k 编码 → 启发式估算**，任何一步失败都静默退回下一级：
+**同时涉及的既有文件（全部为追加式修改，无删除）**：
 
-```python
-    @staticmethod
-    def _load_encoder(model):
-        try:
-            import tiktoken
-        except Exception:
-            return None                      # 没装就是没装，不能影响框架运行
-        try:
-            return tiktoken.encoding_for_model(model)
-        except Exception:
-            try:
-                return tiktoken.get_encoding("cl100k_base")   # 模型名不认识 → 通用编码
-            except Exception:
-                return None                    # 彻底失败 → 上层降级为估算
+```text
+fast_agents/__init__.py                                  ← 追加 context 导出（16 个符号）
+fast_agents/agents/react_agent/react_agent.py            ← 追加 4 个构造参数 + 3 个内部方法
+examples/context/context_react_agent_demo.py             ← 新增示例（5 个）
+test/test_context.py                                     ← 新增测试（16 项）
+test/test_react_agent.py                                 ← 追加 2 项 context 接入回归
 ```
 
-**为什么不把 tiktoken 写进依赖**：它的体积和「零重型依赖」定位不符，而且它只覆盖 OpenAI 系模型。
-把它做成**可选增强**，装了更好、不装也能跑，是这个仓库一贯的做法。
+> **目录为什么是单数 `context/`**：与 `tools/` `memory/` `skills/` `mcp/` 保持一致（模块目录用单数）。注意区分两件事——`fast_agents/context/` 是**模块目录**（单数），而模块内的 `build_context_tools()` 产出的是一组**工具**（复数概念），两者不是一回事。
 
-#### 启发式估算的分类规则
+### 4.2 分层
 
-```python
-def estimate_text_tokens(text, safety_ratio=1.15):
-    cjk = latin = other = 0
-    for ch in text:
-        if _is_cjk(ch):                                   # 中日韩：基本 1 字 1 token
-            cjk += 1
-        elif ch.isascii() and (ch.isalnum() or ch == "_"): # 英文/数字：4 字符 ≈ 1 token
-            latin += 1
-        else:                                             # 标点/空白：2 字符 ≈ 1 token
-            other += 1
-    tokens = cjk + latin / 4.0 + other / 2.0
-    return int(tokens * safety_ratio) + 1
+模块内部按「出口层 → 门面层 → 能力层 → 基础层」四层组织，依赖方向**只向下**（上层可以调下层，下层绝不回调上层）：
+
+```text
+① 出口层     __init__.py
+             导出「计量 / 分层 / 治理 / 门面 / 工具」五组符号
+                 │
+② 门面层     builder.py  ── ContextBuilder
+             对外只有 build / observe / record_turn / reset_turn
+                 │
+③ 能力层     compressor.py ── ContextCompressor      （依赖 tokens + layers + offload）
+             offload.py    ── ContextOffloader       （只依赖标准库）
+             tools.py      ── 4 个 ToolBase           （依赖 offload + tools 模块的 ToolBase）
+                 │
+④ 基础层     layers.py     ── ContextLayer / ContextWindow  （依赖 messages + tokens）
+             tokens.py     ── TokenCounter / TokenBudget     （零依赖，只依赖标准库）
 ```
 
-两条关键取舍：
+这么分的直接好处：**门面可以换、能力层可以换，而基础层（`tokens` / `layers`）几乎不需要动**。比如你想把压缩换成「只摘要不裁剪」，改的是 `ContextCompressor` 的开关（能力层），`TokenCounter` 和 `LAYER_ORDER` 一行都不用碰。
 
-1. **宁可多算，不卡上限** —— 默认乘 `safety_ratio=1.15`。估算少算了 → 请求超窗报错；估算多算了 → 少留几条历史。两害相权，后者代价小得多；
-2. **中文单独处理** —— 中文在 BPE 里基本一字一 token，用「4 字符 1 token」的英文规则去估中文，会**低估到 1/4**，这是最常见的估算错误。
+### 4.3 数据流 / 调用链路
 
-#### 消息级计数：别漏掉固定开销和工具 schema
+一次完整的 `build()`，数据是这样流的（箭头旁标了方法名，可顺藤摸瓜到源码）：
 
-```python
-_PER_MESSAGE_OVERHEAD = 4    # 每条消息的 role / 分隔符开销
-_PER_REQUEST_OVERHEAD = 3    # 每次请求的固定开销
-
-def count_message_tokens(message, counter=None):
-    total = _PER_MESSAGE_OVERHEAD
-    content = message.get("content")
-    if isinstance(content, str):
-        total += counter.count(content)
-    elif isinstance(content, list):                # 多模态块：图片按 85 token 粗算
-        ...
-    for tool_call in message.get("tool_calls") or []:   # function calling 也要算
-        total += counter.count(fn.get("name", "")) + counter.count(fn.get("arguments", "")) + 6
-    return total
+```text
+调用方 / ReActAgent.run()
+        │
+        ├─ system_prompt ─┐
+        ├─ memory packets ┤   参数
+        ├─ history ───────┤
+        ├─ file_snippets ─┤
+        └─ user_input ────┘
+                 │
+                 ▼
+   ContextBuilder.build()                 ← builder.py：五层依次就位
+        │
+        ├─ L1 system  → ContextLayer(required=True, priority=100)
+        ├─ L2 memory  → _render_packets() → _fit_layer(配额 0.25)
+        ├─ L3 history → ContextCompressor.compress(配额 = 剩余)
+        │                    │
+        │                    ├─ ① ContextOffloader.offload()   超长消息 → 落盘，留引用
+        │                    ├─ ② _trim_layer()                 成组裁掉最老历史
+        │                    └─ ③ _summarize_layer()            LLM 摘要，写回层首
+        ├─ L4 files   → _fit_layer(配额 0.25)
+        └─ L5 user    → ContextLayer(required=True, priority=100)
+                 │
+                 ▼
+   _enforce_global_budget()               ← 全局兜底：整窗仍超则继续成组丢最老历史
+                 │
+                 ▼
+   ContextWindow                          ← layers.py
+        ├─ ordered_layers()  按 LAYER_ORDER 排序
+        ├─ flatten()         → List[Message]        （回填 self.messages 工作区）
+        └─ to_openai_messages() → List[dict]        （直接喂 LLM）
+                 │
+                 ▼
+            LLM.invoke()
+                 │
+        ┌────────┴────────┐
+        │ 工具返回超长结果  │
+        ▼                 │
+   ContextBuilder.observe(tool_name, content)     ← 未超阈值原样返回（零 IO）
+        │
+        ▼
+   ContextOffloader 落盘 → 返回「引用文本」放进 tool 消息
+        │
+        ▼
+   模型需要全文时 → 调 read_offloaded(offload_id, start_line, max_lines) 按需回读
 ```
 
-还有一处**最容易被忽略的大开销**——工具 schema：
+链路里有两个**必须记住的先后关系**：
 
-```python
-    def count_tool_schemas(self, tools):
-        """每轮请求都要带全套 schema，10 个工具轻松吃掉一两千 token"""
-        return self.count(json.dumps(list(tools), ensure_ascii=False))
+1. **`observe()` 发生在技能中间件 `after_tool_call` 之前**。顺序是：`invoke_tool → _render_observation → _offload_observation → skill_middleware.after_tool_call`。如果把卸载放在技能中间件之后，中间件加在观察文本里的「纠错前缀」可能被整段卸载掉，模型反而看不到纠错提示；
+2. **`compress()` 只在 history 层做完整三级压缩**。L2 / L4 两层走的是 `_fit_layer()`（只卸载 + 丢最老条目，不做摘要）——因为记忆和文件片段本身就是「可选参考」，没必要为它们多花一次 LLM 调用。
+
+### 4.4 与 ReActAgent 的接入点 / 职责边界
+
+#### 怎么挂进 Agent
+
+context 挂在 `ReActAgent` 上，**与 memory 同级**，都是成员变量：
+
+| 接入项 | 位置 | 说明 |
+|---|---|---|
+| 构造参数 `enable_context` | `__init__` | 是否启用（**默认 `False`**，保持既有行为不变） |
+| 构造参数 `ctx` | `__init__` | 可注入自定义 `ContextBuilder`；不传时自动创建 |
+| 构造参数 `context_budget` | `__init__` | 覆盖默认预算（int，token 数） |
+| 构造参数 `context_offload_threshold` | `__init__` | 触发卸载的字符数阈值（默认 4000） |
+| 成员变量 `self.ctx` | `__init__` | `ContextBuilder` 实例；关闭时为 `None` |
+| `_init_context()` | `__init__` 内调用 | 建 builder + 注册 4 个工具 + 刷新 system 提示词 |
+| `_fit_context(input_text)` | `run()` 内调用 | 用 builder 重建本轮工作区，写回 `self.messages` |
+| `_collect_context_packets(query)` | `_fit_context` 内调用 | 收集「长期记忆 + 会话摘要」，**不含 buffer 历史** |
+| `_offload_observation(name, obs)` | 工具调用后 | 超长观察文本卸载；关闭时原样返回 |
+
+启用后构造与运行时会打印：
+
+```text
+🧭 上下文工程已启用：预算 27000 token / 计数后端 tiktoken / 卸载阈值 4000 字符
+...
+🧭 token 预算 475/27000（1.8%，窗口 32000，预留输出 4000）
 ```
 
-工具 schema 是常驻开销，不随对话增长，但会被计入窗口。做预算规划时必须把它算进去，
-否则会出现「消息只占 60%，但加上 tools 就超了」的情况。
+#### 两条职责边界（全篇最值钱的一段）
 
-#### TokenBudget：把窗口切成「可用」和「预留」
+`ReActAgent` 的既有约定是「**单一数据源**：跨轮历史只存在 `MemoryManager.buffer`，`self.messages` 只是本次 run 的推理工作区」。接入 context 最容易踩坏的就是这条约定，具体是两处：
+
+**边界一：本轮用户输入只能出现一次。**
+
+`run()` 的原有逻辑是：`_seed_workspace()` 搬历史 → 第 1 步 `append_user(user_input)`。而开启 context 后，`_fit_context()` 已经把本轮问题放进了 **L5 user 层**。如果第 1 步再 `append_user` 一次，模型会看到**两条完全相同的 user 消息**——轻则浪费 token，重则让模型以为用户问了两遍。
+
+```python
+                # 系统提示词已在构造/seed 时就位，这里只追加本轮用户输入（仅第 1 步追加）
+                # 开启 context 时，本轮用户输入已由 _fit_context 放进 user 层，无需重复追加
+                if current_step == 1 and not (self.enable_context and self.ctx is not None):
+                    self.messages.append_user(user_input)
+```
+
+**边界二：长期记忆不再二次拼进 user。**
+
+原有逻辑会把检索到的长期记忆 `_merge_memory()` 拼进本轮用户输入文本。开启 context 后，长期记忆改由 **L2 memory 层**统一承载（`_collect_context_packets()` 产出 packet），因此 `user_input` 要还原成原始输入：
+
+```python
+        if self.enable_context and self.ctx is not None:
+            self._fit_context(input_text)
+            user_input = input_text          # 记忆已进 memory 层，user 只留原始问题
+```
+
+这两条边界都有**回归断言**锁死，改动时不会悄悄退化：
+
+- `test_react_agent.py::test_context_user_input_not_duplicated` —— 多工具步场景下，user 输入也只注入一次，不随步数累积；
+- `test_react_agent.py::test_context_enabled_builds_and_registers_tools` —— 开启 context 后 4 个工具确实注册、`agent.ctx` 非空。
+
+> **一处已知的粗糙点**：`_init_context()` 里 `workspace="."` 是硬编码（与 `ReadFileTool` 的默认行为一致）。如果你的工作目录不在启动目录，建议用 `ContextBuilder(workspace="D:/code")` 显式构造后通过 `ctx=` 注入。这一点在[第十章](#十设计决策与常见坑)列为坑项。
+
+## 五、核心机制：五层拼装顺序与三级压缩策略
+
+> 本章是 context 模块的弹性节，收拢两块模块特有机制：**分层怎么排**、**超预算怎么砍**。两块合起来回答了本模块最核心的问题——「窗口满了，动谁、怎么动、动到什么程度」。
+
+### 5.1 五层拼装顺序
+
+拼装顺序由 `layers.py` 里的常量 `LAYER_ORDER` 定义（数字越小越靠前）：
+
+```python
+LAYER_ORDER: Dict[str, int] = {
+    "system": 10,
+    "memory": 20,
+    "summary": 25,
+    "history": 30,
+    "files": 40,
+    "tool_result": 45,
+    "user": 90,
+}
+```
+
+| 层 | order | required | priority | 内容 | 为什么在这个位置 |
+|---|---|---|---|---|---|
+| **system** | 10 | ✅ | 100 | 身份 + 工具清单 + 技能索引 | 最稳定，做 prompt caching 的锚点；**绝不裁剪** |
+| **memory** | 20 | ❌ | 80 | 长期记忆 + 会话摘要 | 跨轮变化慢，放前面利于缓存 |
+| **summary** | 25 | ❌ | — | 压缩产物专用位（预留） | 摘要本质是「历史的替身」，紧贴 history |
+| **history** | 30 | ❌ | 60 | 历轮 user / assistant | 唯一持续增长的一层，压缩的主战场 |
+| **files** | 40 | ❌ | 40 | 文件片段 / 卸载回读 | 动态、按需，放历史之后 |
+| **tool_result** | 45 | ❌ | — | 当轮工具结果（预留） | 与 files 同级，纯动态 |
+| **user** | 90 | ✅ | 100 | 本轮问题 | **必须在最后**，紧贴模型待办事项 |
+
+两条不可动摇的规则：
+
+1. **`system` 在最前、`required=True`**。它是整段上下文里最长、最稳的一段，缓存收益最大；同时裁剪器永远不动它。
+2. **`user` 在最后、`required=True`**。模型对「离得最近的内容」注意力最集中，把待回答问题压在最底部，指令遵循最稳。
+
+> **为什么顺序要写成「数据」而不是「代码里的 if-else」**：因为这样一来，**裁剪器不需要知道谁是 system、谁是 history**。它只看 `required` 和 `priority` 两个字段做决策。要新增一层（比如 `summary`），只需在 `LAYER_ORDER` 里加一行；要调整优先级，只改数字。这就是「把顺序和优先级做成数据」的收益。
+
+### 5.2 三级压缩策略
+
+当 `history` 层超出配额，`ContextCompressor.compress()` 按固定顺序依次尝试，**上一级解决不了才进下一级**：
+
+| 级别 | 策略 | 手段 | 信息损失 | 代价 | 触发条件 |
+|---|---|---|---|---|---|
+| **第 1 级** | **卸载**（offload） | 超长消息落盘，上下文里只留引用 id + 预览 | **无损失**（全文可回读） | 一次磁盘写 | `enable_offload` 且传了 `offloader` |
+| **第 2 级** | **裁剪**（trim） | 按「原子组」丢掉最老的历史 | **有损失**（不可逆），但保住了 tool 配对 | 极低（纯内存操作） | 卸载后仍超配额，且 `enable_trim` |
+| **第 3 级** | **摘要**（summary） | 让 LLM 把被压掉的历史写成一段话，写回层首 | **有损**（细节丢失） | 一次额外 LLM 调用，可能失败 | 裁剪后仍超配额，且有 `llm` |
+
+三条设计取舍：
+
+1. **把「卸载」放在最前，是本实现与多数框架最不一样的地方。** LangChain / LlamaIndex 的主流做法是「裁剪 + 摘要」，而本实现认为：**能靠落盘解决的，绝不用有损手段解决**。一次 `web_search` 的 5 万字符结果落盘后，模型需要时随时 `read_offloaded` 回读——信息零损失，上下文却只剩几十字符；
+2. **「裁剪」必须以组为单位，tool 配对绝不拆散。** 这是 OpenAI 的强校验：`tool` 消息必须紧跟在带 `tool_calls` 的 `assistant` 消息之后。乱裁会直接 400。所以裁剪前先调 `_group_messages()` 切原子组；
+3. **「摘要」一定要能失败。** 摘要是一次额外 LLM 调用，它自己就可能限流 / 超时 / 抽风。本实现让它**双层降级**：LLM 调用失败 → 退回截断；截断也拿不到东西 → 上层还有 `keep_recent` 保底。
+
+#### 什么场景选哪一级
+
+| 场景 | 建议 | 理由 |
+|---|---|---|
+| 工具结果动辄几万字符（搜索、抓网页、读大文件） | **开全部三级**（默认） | 卸载吃掉大头，后两级很少走到 |
+| 历史以「短问答」为主，几乎没有长结果 | 关卸载、留裁剪 + 摘要 | 卸载没有收益，还平白落盘 |
+| 有严格的「中间步骤不能丢」要求 | **只开卸载 + 摘要，关裁剪** | 裁剪不可逆；宁可多花一次 LLM 调用 |
+| 没有可用的 LLM（本地小模型 / 离线） | 关摘要 | 摘要需要 LLM；关闭后靠前两级兜底 |
+| 预算极紧（4k 窗口） | 三级全开 + 调小 `keep_recent` | 必须榨干每一 token |
+
+### 5.3 卸载与回读：模型看到的是什么
+
+卸载不是「把内容删掉」，而是**把内容搬到一个模型能自己取回来的地方**。`offload()` 落盘后返回的引用文本形如：
+
+```text
+[工具结果已卸载] 工具 `web_search` 返回了 52360 字符，全文已写入离线文件，不在上下文中。
+offload_id=8f3a1c9d2e4b6a70
+内容开头预览：第一条搜索结果：上下文工程（context engineering）是……
+如需查看完整内容，调用工具 read_offloaded(tool_name 的 offload_id="8f3a1c9d2e4b6a70"，
+可选 start_line/max_lines) 按需读取。
+```
+
+这段文字的设计要点有三：**说清事实**（原文多长、已外置）、**给出坐标**（`offload_id`）、**教会方法**（调用哪个工具、支持什么参数）。模型读了这段，就知道「这里有东西、但它不在我眼前、我该用什么取」。
+
+回读 `read_offloaded(offload_id, start_line=1, max_lines=200)` 返回带行号的分段文本：
+
+```text
+📦 卸载内容 8f3a1c9d2e4b6a70（来自工具 web_search，共 1873 行，显示 1-200 行）
+    1|第一条搜索结果：……
+    2|……
+  ...|...
+  200|……
+⚠️ 未读完，如需后续内容把 start_line 设为 201
+```
+
+**为什么默认只回读 200 行而不是全文**：如果回读也把 5 万字符全塞回去，上下文立刻又爆了——那就等于没卸载。分段回读让模型自己控制「这次要看多少」，这是「按需」两个字的具体落点。
+
+---
+
+## 六、核心数据模型
+
+context 模块的数据模型**全部用 `dataclasses.dataclass`**，没有用 pydantic。这是刻意的：`memory` / `mcp` 里用 pydantic 的是**需要校验的外部输入**（工具参数、配置），而 context 里的对象都是**模块内部流转的结构**，不涉及不可信输入，用 `dataclass` 更轻、更快、更易读。**需要校验的两个地方另有出口**：工具入参用 pydantic（见 `7.7` 的 `ReadOffloadedInput` 等）。
+
+命名对齐既有约定：工具类照旧用 `args_schema`（不是 `param_model`）、`run()`（不是别的）、`to_openai_tool()`；返回结构化结果照旧用 `ToolResult`。
+
+### 6.1 `TokenBudget`（`tokens.py`）
+
+把「模型窗口」切成「可用预算」和「预留回复空间」。
 
 ```python
 @dataclass
 class TokenBudget:
-    max_context_tokens: int = 128_000    # 模型窗口
-    reserve_for_output: int = 4_000      # 给回复留的空间
-    safety_margin: int = 1_000           # 估算误差的缓冲
-
-    @property
-    def available(self) -> int:
-        return max(1, self.max_context_tokens - self.reserve_for_output - self.safety_margin)
+    max_context_tokens: int = 128_000   # 模型上下文窗口
+    reserve_for_output: int = 4_000     # 给模型回复预留的空间
+    safety_margin: int = 1_000          # 估算误差的安全余量
 ```
 
-`reserve_for_output` 是最容易被省略、也最不能省的一项：不预留的话，输入占满窗口后模型没有余量输出，
-会出现「请求成功但回答被截断」或者直接 400，而且**报错信息往往很难指向真实原因**。
+| 字段 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `max_context_tokens` | `int` | `128_000` | 模型窗口大小（4k / 8k / 32k / 128k / 200k） |
+| `reserve_for_output` | `int` | `4_000` | **必须预留**：不预留的话输入占满窗口后模型没余量输出，会「请求成功但回答被截断」或直接 400 |
+| `safety_margin` | `int` | `1_000` | 估算误差余量（启发式计数有 ±15% 误差） |
 
-### 4.2 `layers.py` —— 分层：拼装顺序也是一份数据
-
-上下文不是一根绳子，而是**分层叠起来的**。分层管两件事：**拼装顺序**和**裁剪优先级**。
-
-#### LAYER_ORDER：静态在前、动态在后
+关键公式与四个方法：
 
 ```python
-LAYER_ORDER = {
-    "system": 10,       # 身份 + 工具清单 + 技能索引   静态，required，缓存锚点
-    "memory": 20,       # 长期记忆 + 会话摘要          低频变化
-    "summary": 25,      # 压缩产生的历史摘要           低频变化
-    "history": 30,      # buffer 窗口内的 user/assistant 滚动
-    "files": 40,        # 文件片段 / 卸载回读           动态
-    "tool_result": 45,  # 工具结果（按需注入时）        动态
-    "user": 90,         # 本轮问题                     必须最后
-}
+available = max_context_tokens - reserve_for_output - safety_margin   # 可放输入的预算
 ```
 
-这个顺序不是随意排的，它同时满足两个硬约束：
+| 方法 / 属性 | 返回 | 说明 |
+|---|---|---|
+| `available` | `int` | 可用于输入的预算（下限保护为 1） |
+| `remaining(used)` | `int` | 还能再放多少 |
+| `usage_ratio(used)` | `float` | 预算使用率（>1 表示已超） |
+| `is_over(used)` | `bool` | 是否超预算 |
+| `describe(used)` | `str` | 一行日志摘要 |
 
-1. **prompt caching 是前缀匹配** —— 从请求开头到缓存断点必须逐 token 一致。一旦某轮变动的记忆被写进 system 中段，**后面所有内容和断点全部失效**，长会话成本翻倍。所以「静态在前、动态在后」不是风格偏好，是钱；
-2. **指令层级** —— 本轮问题必须离模型最近（最后），保证模型不会被人情世故式的历史带偏。
+### 6.2 `ContextLayer`（`layers.py`）
 
-#### ContextLayer：每层自带裁剪策略
+上下文中的**一层**。它是「分层」概念的最小载体，也是裁剪器唯一需要理解的对象。
 
 ```python
 @dataclass
 class ContextLayer:
     name: str
     messages: List[Message] = field(default_factory=list)
-    priority: int = 50        # 越大越先保留
-    required: bool = False    # True 表示绝不裁剪
-
-    @property
-    def order(self) -> int:
-        return LAYER_ORDER.get(self.name, 60)   # 未知层排在 history 与 user 之间
+    priority: int = 50
+    required: bool = False
+    metadata: Dict[str, Any] = field(default_factory=dict)
 ```
 
-把 `priority` / `required` **做成字段而不是写死在代码里**，好处是裁剪逻辑不用关心谁是 system、
-谁是 user，只要看标记就行。`system` 层和本轮 `user` 层都标 `required=True, priority=100`，
-因此压缩器天然会跳过它们，不需要在压缩器里写「如果是 system 就……」。
+| 字段 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `name` | `str` | 必填 | 层名（`system` / `memory` / `history` / `files` / `user`） |
+| `messages` | `List[Message]` | `[]` | 这一层的消息 |
+| `priority` | `int` | `50` | 裁剪优先级，**越大越先保留** |
+| `required` | `bool` | `False` | `True` 表示**绝不裁剪**（system / 本轮 user） |
+| `metadata` | `Dict` | `{}` | 附加信息，便于调试统计 |
 
-#### ContextWindow：flatten 与 validate
+关键属性 / 方法：
+
+| 成员 | 返回 | 说明 |
+|---|---|---|
+| `order`（property） | `int` | 拼装顺序，查 `LAYER_ORDER`；未知层默认 60（history 与 user 之间） |
+| `is_empty()` | `bool` | 层里有没有消息 |
+| `token_count(counter)` | `int` | 本层 token 数（按 OpenAI 格式逐条累计） |
+| `add(msg)` / `extend(msgs)` / `clear()` | `self` | 就地增删 |
+
+### 6.3 `ContextWindow`（`layers.py`）
+
+上下文窗口：一组按层名索引的 `ContextLayer`。核心动作只有一个——`flatten()`：按层序把各层拼成一串 `Message`。
+
+| 方法 | 返回 | 说明 |
+|---|---|---|
+| `add_layer(layer)` | `ContextLayer` | 加一层；**同名层会合并**（并取更宽松的 `required` / 更高的 `priority`） |
+| `get_layer(name)` | `ContextLayer \| None` | 按名取层 |
+| `list_layers()` | `List[ContextLayer]` | 取全部层（添加顺序） |
+| `append_message(name, msg, **kw)` | `ContextLayer` | 往指定层追加一条，层不存在自动建 |
+| `ordered_layers()` | `List[ContextLayer]` | 按 `order` 排序（稳定排序，同层内保序） |
+| `flatten()` | `List[Message]` | 按层序拼成 `Message` 列表 |
+| `to_openai_messages()` | `List[dict]` | 按层序拼成 OpenAI 格式，直接喂 LLM |
+| `token_count(counter)` | `int` | 整窗 token |
+| `layer_stats(counter)` | `List[dict]` | 逐层统计（供打印「上下文构成」） |
+| `validate()` | `List[str]` | 层级卫生检查：tool 消息是否有配对 |
+
+`validate()` 是**上线前的最后一道闸门**，它专门检查那条最容易 400 的规则：
 
 ```python
-    def flatten(self) -> List[Message]:
-        """按层序拼成一条 Message 列表"""
-        result = []
-        for layer in self.ordered_layers():     # sorted by layer.order，稳定排序
-            result.extend(layer.messages)
-        return result
-```
-
-`validate()` 是**结构化消息协议的自检**，专门用来抓「tool 配对被拆坏」这类隐蔽错误：
-
-```python
-    def validate(self) -> List[str]:
-        problems = []
+        problems: List[str] = []
         previous_had_tool_calls = False
         for message in self.flatten():
             if message.role == "tool" and not previous_had_tool_calls:
-                problems.append(f"tool 消息缺少配对的 assistant(tool_calls)：...")
+                problems.append(
+                    f"tool 消息缺少配对的 assistant(tool_calls)：{str(message.content)[:40]!r}"
+                )
             previous_had_tool_calls = bool(message.tool_calls)
         return problems
 ```
 
-**为什么这条检查必须有**：OpenAI 强校验 `tool` 消息必须严格跟在带 `tool_calls` 的 `assistant` 之后，
-一旦裁剪把 `assistant(tool_calls)` 挤掉却留下孤立的 `tool` 结果，请求**当场 400**，
-而且错误信息只说「tool message 没有对应 tool_call」，不告诉你是哪一步裁坏的。有了 `validate()`，
-测试里就能在发请求之前把它抓出来。
+### 6.4 `OffloadRecord`（`offload.py`）
 
-### 4.3 `offload.py` —— 卸载：大结果落盘，上下文只留引用
+一次卸载的元数据，会写进 `index.json`。
 
-问题很直白：一次 `read_file` 或 `web_search` 可能返回几万字符，直接塞进 tool 消息，几轮下来上下文就爆了——
-**而且后面几轮根本不再需要全文**。
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `offload_id` | `str` | 卸载 id（`uuid4().hex[:16]`，只含十六进制字符） |
+| `tool_name` | `str` | 来源工具名（便于溯源） |
+| `path` | `str` | 正文文件路径 |
+| `original_chars` | `int` | 原始字符数 |
+| `summary` | `str` | 摘要（默认取预览前 200 字） |
+| `preview` | `str` | 预览（默认前 400 字符） |
+| `created_at` | `float` | 创建时间戳（淘汰排序用） |
+| `metadata` | `Dict` | 附加元数据 |
 
-方案对齐 Anthropic 的「tool result 截断 + 文件回读」与 DeepAgents 的「会话状态外化成文件」：
-**大结果落盘，上下文里只留摘要 + 引用 id，模型真想看全文时再用 `read_offloaded` 按 id 回读（可指定行区间）**。
+提供 `to_dict()` / `from_dict()` 做 `index.json` 的序列化往返；`ensure_ascii=False` 保证中文可读。
 
-落盘布局：
+### 6.5 `CompressionReport`（`compressor.py`）
 
+一次压缩的结果报告，便于日志与测试断言。
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `offloaded` | `int` | 被卸载的消息条数 |
+| `trimmed` | `int` | 被裁掉的原始消息条数 |
+| `summarized` | `bool` | 是否生成了新摘要 |
+| `tokens_before` / `tokens_after` | `int` | 压缩前后 token |
+| `notes` | `List[str]` | 过程备注 |
+| `saved`（property） | `int` | 省下的 token |
+| `summary_line()` | `str` | 一行日志，形如「压缩：卸载 2 条 / 裁剪 6 条 / 摘要 否；token 9000 → 2400（省 6600）」 |
+
+### 6.6 `BuildReport`（`builder.py`）
+
+一次 `build()` 的结果报告。
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `tokens` | `int` | 整窗 token |
+| `stats` | `List[dict]` | 逐层统计（同 `layer_stats()`） |
+| `compression` | `CompressionReport \| None` | 本次 history 层的压缩报告 |
+| `warnings` | `List[str]` | 告警（如「兜底再裁 6 条」「某层即使清空仍超配额」） |
+| `describe()` | `str` | 多行报告，形如： |
+
+```text
+上下文构成：3 层 / 8 条消息 / 1240 token
+  system     1 条   820 token  required
+  history    6 条   380 token
+  user       1 条    40 token  required
 ```
-<workspace>/.fast_agents/context/offload/
-├── index.json          # 索引：id → 元数据（工具名、原始长度、摘要、预览）
-└── <id>.txt            # 正文（全文，不截断）
-```
 
-#### 核心方法：should_offload / offload / read
+---
+
+## 七、逐个文件讲解
+
+### 7.1 `__init__.py` —— 模块出口
+
+**负责什么**：把「计量 / 分层 / 治理 / 门面 / 工具」五组符号统一导出，并按这个分组维护 `__all__`。
 
 ```python
-    def should_offload(self, text, threshold=None) -> bool:
-        return len(text or "") > (self.threshold if threshold is None else threshold)
+from .builder import BuildReport, ContextBuilder
+from .compressor import CompressionReport, ContextCompressor, DEFAULT_COMPACT_PROMPT
+from .layers import LAYER_ORDER, ContextLayer, ContextWindow
+from .offload import ContextOffloader, OffloadRecord
+from .tokens import TokenBudget, TokenCounter, count_message_tokens, estimate_text_tokens
+from .tools import (EditFileTool, ListFilesTool, ReadOffloadedTool,
+                    WriteFileTool, build_context_tools)
 
+__version__ = "1.0.0"
+```
+
+**为什么这么写**：`__all__` 的顺序不是随意的，而是**按「计量 → 分层 → 治理 → 门面 → 工具」的概念顺序**排列——读者打开这个文件，就能一眼看出模块的分组结构。另外 `__version__ = "1.0.0"` 是包内版本号，与仓库根 `fast_agents/version.py` 的 `0.0.1` 是两套（前者标模块，后者标框架），别混。
+
+> **你要加东西时最该看这里**：新增可公开的类，必须同时改 `__init__.py` 的 `import` 与 `__all__`，否则 `from fast_agents.context import Xxx` 会失败（对齐 `memory` 模块的约定）。
+
+### 7.2 `tokens.py` —— 计量：先知道有多少，才谈得上怎么裁
+
+**负责什么**：`TokenCounter`（token 计数）+ `TokenBudget`（预算换算）+ 三个估算函数。整个模块的「地基」。
+
+#### 三级降级计数
+
+```python
+    @staticmethod
+    def _load_encoder(model: str):
+        """尝试加载 tiktoken 编码器；任何异常都返回 None（降级）"""
+        try:
+            import tiktoken  # type: ignore
+        except Exception:            # noqa: BLE001 —— 没装就是没装，不能影响框架运行
+            return None
+        try:
+            return tiktoken.encoding_for_model(model)
+        except Exception:            # noqa: BLE001 —— 模型名不认识时退回通用编码
+            try:
+                return tiktoken.get_encoding("cl100k_base")
+            except Exception:        # noqa: BLE001
+                return None
+```
+
+**为什么这么写**：`tiktoken` 是**可选增强**而非硬依赖。三层尝试（按模型找编码 → 退回通用编码 → 放弃），每一层都用 `except` 兜住，**最终一定不会抛异常**。`self.backend` 会记下当前用的是 `"tiktoken"` 还是 `"heuristic"`，日志里能直接看到。
+
+#### 启发式估算：中文单独处理
+
+```python
+def estimate_text_tokens(text: str, safety_ratio: float = 1.15) -> int:
+    cjk = latin = other = 0
+    for ch in text:
+        if _is_cjk(ch):                                    # 中日韩：基本 1 字 1 token
+            cjk += 1
+        elif ch.isascii() and (ch.isalnum() or ch == "_"):  # 英文/数字：4 字符 ≈ 1 token
+            latin += 1
+        else:                                              # 标点/空白：2 字符 ≈ 1 token
+            other += 1
+    return int((cjk + latin / 4.0 + other / 2.0) * safety_ratio) + 1
+```
+
+**为什么中文要单独算**：BPE 分词里，**一个汉字基本就是一个 token**，而英文是 4 个字符左右一个 token。如果用「总字符数 / 4」这种粗糙公式估中文，会**严重低估**（中文实际约是估值的 4 倍），结果就是「以为没超、其实已经爆了」。所以这里按 CJK / 拉丁 / 其他三类分开累加，最后乘安全系数 `1.15`，**宁可多算不可少算**。
+
+#### 消息级计数：别漏掉固定开销
+
+```python
+_PER_MESSAGE_OVERHEAD = 4    # 每条消息的固定开销
+_PER_REQUEST_OVERHEAD = 3    # 每次请求的固定开销
+```
+
+`count_message_tokens()` 会把三类东西算进去：**正文**（文本块）、**多模态块**（图片按固定 85 token 粗算）、**function calling**（工具名 + 参数 JSON，再加 6 token 结构开销）。很多人只算 `content`，结果每轮都少算几百上千 token。
+
+`count_tool_schemas()` 单独统计工具 schema 的开销——**这是最容易被忽略的一块**：每轮请求都要带全套 schema，10 个工具轻松吃掉一两千 token。
+
+> **你要改计数精度时最该看这里**：换 tokenizer、调整 `safety_ratio`、改多模态粗算值，都在这个文件。
+
+### 7.3 `layers.py` —— 分层：拼装顺序也是一份数据
+
+**负责什么**：`ContextLayer` / `ContextWindow` / `LAYER_ORDER`。管两件事——**拼装顺序**与**裁剪优先级**。
+
+#### 顺序做成常量
+
+```python
+# 层的标准顺序（数字越小越靠前，越靠前越静态、越适合被缓存）
+LAYER_ORDER: Dict[str, int] = {
+    "system": 10, "memory": 20, "summary": 25,
+    "history": 30, "files": 40, "tool_result": 45, "user": 90,
+}
+```
+
+**为什么这么写**：一旦顺序是常量，`ContextLayer.order` 就只是个查表动作，`ordered_layers()` 只是个 `sorted`。**要加层、要调序，只改这张表**，不碰任何逻辑。
+
+#### 同名层合并而非覆盖
+
+```python
+    def add_layer(self, layer: ContextLayer) -> ContextLayer:
+        existing = self.get_layer(layer.name)
+        if existing is not None:
+            existing.messages.extend(layer.messages)
+            existing.required = existing.required or layer.required
+            existing.priority = max(existing.priority, layer.priority)
+            existing.metadata.update(layer.metadata)
+            return existing
+        self._layers.append(layer)
+        return layer
+```
+
+**为什么这么写**：合并时取**更宽松的 `required`**、**更高的 `priority`**——这是「安全侧优先」：如果同一层被两次以不同严格度添加，保留更不容裁剪的那个，避免出现「本该 required 的层被裁掉」。
+
+#### 卫生检查
+
+`ContextWindow.validate()` 只做一件事：扫一遍 `flatten()` 的结果，检查有没有**孤立的 tool 消息**。这是 OpenAI 接口的强校验项，也是本模块唯一「宁可报错也不放过」的地方。
+
+> **你要调层序、加新层时最该看这里**：`LAYER_ORDER` 加一行 + 在 builder 的 `build()` 里 `add_layer`。
+
+### 7.4 `offload.py` —— 卸载：大结果落盘，上下文只留引用
+
+**负责什么**：`ContextOffloader`——把超长工具结果写到磁盘，返回一段「引用文本」，并支持按 id / 行区间回读。
+
+#### 落盘布局与路径安全
+
+```text
+<workspace>/.fast_agents/context/offload/
+├── index.json      # id → 元数据（工具名、原长、摘要、预览）
+└── <id>.txt        # 正文
+```
+
+```python
+_SAFE_ID = re.compile(r"^[0-9a-f]{6,64}$")     # id 只允许十六进制字符
+...
+        self.workspace = Path(workspace).resolve()
+        self.root = (self.workspace / subdir).resolve()
+        # 安全兜底：卸载目录必须仍在 workspace 内
+        try:
+            self.root.relative_to(self.workspace)
+        except ValueError:
+            raise ValueError("卸载目录必须位于 workspace 内")
+```
+
+**为什么这么写**：id 用 `uuid4().hex[:16]`（纯十六进制），再用白名单正则卡一道，**从源头杜绝 `../` 路径穿越**；`read()` 里还会再校验一次目标文件是否仍在 `workspace` 内。这套思路与 `ReadFileTool` 的沙箱一致。
+
+#### 没超阈值 → 零 IO
+
+```python
     def offload(self, tool_name, text, *, threshold=None, summary="", metadata=None) -> str:
         text = text or ""
         if not self.should_offload(text, threshold):
-            return text                          # ← 没超阈值原样返回，零 IO
-        offload_id = uuid4().hex[:16]
-        path = self.root / f"{offload_id}.txt"
-        try:
-            path.write_text(text, encoding="utf-8")
-        except Exception as e:
-            return self._fallback_truncate(text, str(e))   # ← 落盘失败退回截断，不能让对话中断
+            return text                     # ← 没超阈值：原样返回，不落盘、不写索引
         ...
-        return self._render_reference(record)
 ```
 
-两个必须守住的健壮性原则：
+**为什么这么写**：这让 `offload()` **可以无脑在每次工具返回后调用**（Agent 主循环就是这么做的）。绝大多数工具结果都很短，走的是「原样返回」这条零开销路径，只有真正超大时才付出磁盘代价。
 
-- **无脑调用也安全** —— `offload()` 在没超阈值时直接 return 原文，**不产生任何 IO**。正因如此，Agent 主循环里可以「每次工具返回都调一次」，不需要自己判断该不该卸载；
-- **卸载失败不能让对话中断** —— 磁盘满、权限不足都可能导致写盘失败，此时退回「截断 + 提示」，对话继续，只是丢了全文。
+#### 有界增长
 
-#### 引用文本：要明确告诉模型「东西去哪了、怎么拿回来」
+`max_files=200`（默认）是硬上限：超过时按 `created_at` 淘汰**最早创建**的卸载文件。没有这个上限，一个长跑进程会无声无息把磁盘写满。
 
-```python
-    def _render_reference(self, record) -> str:
-        return (
-            f"[工具结果已卸载] 工具 `{record.tool_name}` 返回了 {record.original_chars} 字符，"
-            f"全文已写入离线文件，不在上下文中。\n"
-            f"offload_id={record.offload_id}\n"
-            f"内容开头预览：{record.preview[:200]}\n"
-            f"如需查看完整内容，调用工具 read_offloaded(tool_name 的 offload_id="
-            f"\"{record.offload_id}\"，可选 start_line/max_lines) 按需读取。"
-        )
-```
-
-**这段文本是修过一版才定下来的**。只写「已卸载到文件」不够——模型会一头雾水地反复重试原工具。
-必须三件事都给全：**卸载了什么**（工具名 + 原长度）、**内容开头长什么样**（预览，让模型判断要不要读）、
-**怎么取回**（工具名 + 参数名 + 可选参数）。
-
-#### 回读与行区间
+#### 回读：行区间 + 可读错误
 
 ```python
     def read(self, offload_id, start_line=1, end_line=None, max_lines=200) -> str:
-        if not _SAFE_ID.match(offload_id or ""):        # id 白名单，杜绝 ../ 穿越
+        if not _SAFE_ID.match(offload_id or ""):
             return f"[读取失败] 非法的 offload_id：{offload_id!r}"
         record = self._index.get(offload_id)
         if record is None:
             return f"[读取失败] 未找到 offload_id={offload_id} 的卸载记录（可能已被淘汰）"
         ...
-        numbered = "\n".join(f"{i:>5}|{line}" for i, line in enumerate(selected, start))
-        header = f"📦 卸载内容 {offload_id}（来自工具 {record.tool_name}，共 {total} 行，显示 {start}-{stop} 行）"
-        if stop < total:
-            header += f"\n⚠️ 未读完，如需后续内容把 start_line 设为 {stop + 1}"
-        return f"{header}\n{numbered}"
 ```
 
-三个细节都对齐 `ReadFileTool`：
+**为什么返回错误字符串而不是抛异常**：这个方法会被模型通过 `read_offloaded` 工具调用，**参数是模型给的**。模型完全可能编一个不存在的 id。如果抛异常，工具链就断了；返回可读的错误文本，模型看到「未找到」会自己换个 id 或换思路——**把纠错权交还给模型**。
 
-- **带行号、支持区间、有续读提示** —— 大文件可以分几次读，而不是一次性拉回又爆上下文；
-- **失败返回可读文本而不是抛异常** —— 工具链不能因为「id 写错了」就断掉，模型看到错误提示能自己纠正；
-- **id 白名单** —— 只允许十六进制字符，路径穿越（`../../etc/passwd`）在入口就被挡住。
+> **你要调卸载粒度时最该看这里**：`threshold`（触发阈值）、`preview_chars`（预览长度）、`max_files`（上限）。
 
-#### 有界增长：淘汰而非无限堆积
+### 7.5 `compressor.py` —— 治理：三级策略，逐级降级
+
+**负责什么**：`ContextCompressor`——对 `history` 层做三级压缩，产出 `CompressionReport`。
+
+#### 主入口：逐级尝试
 
 ```python
-    def _enforce_limit(self) -> None:
-        if self.max_files <= 0 or len(self._index) <= self.max_files:
-            return
-        ordered = sorted(self._index.values(), key=lambda r: r.created_at)
-        for record in ordered[: len(self._index) - self.max_files]:   # 淘汰最早创建
-            Path(record.path).unlink(missing_ok=True)
-            self._index.pop(record.offload_id, None)
-```
-
-卸载目录会随会话一直写下去，必须设上限（默认 200 个文件）。淘汰策略选「最早创建」而不是
-「最久未访问」，因为后者需要在 `read()` 里回写时间戳、增加 IO 和并发复杂度，收益不成比例。
-
-### 4.4 `compressor.py` —— 治理：三级策略，逐级降级
-
-预算超了怎么办？不同框架各有各的招（LangChain 的 `trim_messages`、LangGraph 的 `SummarizationNode`、
-Anthropic 的 compaction）。这里把它做成**可插拔的三级策略**：
-
-```
-第 1 级  卸载 offload   —— 把超长 tool 结果写到磁盘，上下文只留引用（最优，信息不丢）
-第 2 级  裁剪 trim      —— 从最老的历史开始成组丢弃 user/assistant（快，会丢信息）
-第 3 级  摘要 summarize —— 把丢弃的历史交给 LLM 压成一段话（慢，但保住要点）
-```
-
-**为什么是这个顺序**：优先选「信息不丢」的策略。卸载只是把内容挪了位置，模型想要还能拿回来；
-裁剪是直接丢；摘要是**不可逆的有损压缩**，而且依赖一次额外的 LLM 调用（慢、可能失败、可能失真）。
-把最贵最不可逆的放在最后，只有前两级都救不回来才动用。
-
-#### compress：逐级判断，够用就停
-
-```python
-    def compress(self, layer, counter, budget) -> CompressionReport:
-        limit = budget.available if hasattr(budget, "available") else int(budget)
-        report = CompressionReport()
-        report.tokens_before = layer.token_count(counter)
-        if report.tokens_before <= limit:
-            report.tokens_after = report.tokens_before
-            return report                                    # ← 没超就直接返回
-
+        # 第 1 级：卸载超长消息（信息不丢，收益最大）
         if self.enable_offload and self.offloader is not None:
-            self._offload_layer(layer, report)               # 第 1 级
+            self._offload_layer(layer, report)
+
+        # 第 2 级：成组裁剪最老的历史
         if self.enable_trim and layer.token_count(counter) > limit:
-            self._trim_layer(layer, limit, counter, report)   # 第 2 级（每一级都重新判断）
+            self._trim_layer(layer, limit, counter, report)
+
+        # 第 3 级：仍然超预算 → 摘要（把裁掉的内容压成一段话）
         if self.enable_summary and layer.token_count(counter) > limit:
-            self._summarize_layer(layer, limit, counter, report)  # 第 3 级
-        report.tokens_after = layer.token_count(counter)
-        return report
+            self._summarize_layer(layer, limit, counter, report)
 ```
 
-注意每一级之前都**重新算一次 token**：卸载可能已经解决问题，就不必再裁剪。
-这也是「三级策略」而不是「一次全做」的意义。
+**为什么这么写**：每一级执行完都**重新判断一次是否仍超预算**（注意第 2、3 级的 `if` 条件），所以能自然做到「第一级就够了就不做第二级」。这比「按比例各做一点」更省，也更符合「先便宜后昂贵」的思路。
 
 #### 成组切割：tool 配对绝不拆散
 
 ```python
-def _group_messages(messages) -> List[List[Message]]:
-    """把消息按「原子组」切开：
-    - assistant(tool_calls) + 后续 tool 消息 → 一组（不可拆）
-    - 其余每条消息各自成组
+def _group_messages(messages: Sequence[Message]) -> List[List[Message]]:
+    """把消息按「原子组」切开
+    - assistant(tool_calls) + 后续 tool 消息 → 一组（不可拆）；
+    - 其余每条消息各自成组。
     """
-    groups, buffer = [], None
+    groups: List[List[Message]] = []
+    buffer: Optional[List[Message]] = None
     for message in messages:
         if message.role == "assistant" and message.tool_calls:
-            buffer = [message]
-            groups.append(buffer)
-            continue
+            buffer = [message]; groups.append(buffer); continue
         if message.role == "tool" and buffer is not None:
-            buffer.append(message)
-            continue
+            buffer.append(message); continue
         buffer = None
         groups.append([message])
     return groups
 ```
 
-**这是「不许把 tool 配对拆坏」这条硬规则在代码里的落点。** 裁剪和摘要都以「组」为单位，
-所以永远不可能出现「留了 tool 结果、丢了对应的 assistant(tool_calls)」这种 400 组合。
-`test_context.py` 里 `test_compressor_trim_keeps_tool_pairing` 专门锁死这一条。
+**这是「不许把 tool 配对拆坏」这条硬规则在代码里的落点。** 裁剪和全局兜底都以「组」为单位，所以永远不可能出现「留了 tool 结果、丢了对应的 `assistant(tool_calls)`」这种 400 组合。`test_compressor_trim_keeps_tool_pairing` 专门锁死这一条。
 
 #### 摘要失败必须降级
 
@@ -592,10 +782,7 @@ def _group_messages(messages) -> List[List[Message]]:
         return history_text[: self.summary_max_words * 2]
 ```
 
-**摘要是一次额外的 LLM 调用，它自己就可能失败**（限流、超时、格式异常）。
-如果让它抛异常上去，用户会因为「压缩失败」而拿不到任何回答——这是典型的「为了优化体验反而毁掉体验」。
-所以这里是**双层降级**：LLM 调用失败 → 退回截断；截断也拿不到东西 → 上层还有 `keep_recent` 保底。
-处理方式与 `BufferMemory._summarize` 保持一致。
+**为什么这么写**：摘要是一次额外 LLM 调用，它自己就可能失败。如果让它抛异常上去，用户会因为「压缩失败」而拿不到任何回答——典型的「为了优化体验反而毁掉体验」。所以是**双层降级**：LLM 失败 → 退回截断；截断也拿不到东西 → 上层还有 `keep_recent` 保底。处理方式与 `BufferMemory._summarize` 一致。
 
 #### 摘要写回层里，而不是丢掉
 
@@ -606,29 +793,23 @@ def _group_messages(messages) -> List[List[Message]]:
         ] + keep
 ```
 
-摘要以 `required=True` 的一条消息形式**写回 history 层开头**，后面接保留下来的最近若干条。
-这样下一轮再 build 时，这段摘要仍在，不会「压完就忘」。
-`self._accumulated_summary` 也留了一份，供 Agent 跨轮注入使用。
+摘要以一条消息形式**写回 history 层开头**，后面接保留下来的最近若干条。这样下一轮再 build 时这段摘要仍在，不会「压完就忘」。`self._accumulated_summary` 也留了一份，供 Agent 跨轮注入（`ContextBuilder.summary` 属性暴露）。
 
-#### 关于缓存断点的一处扩展位
+> **你要换压缩策略时最该看这里**：三个 `enable_*` 开关、`keep_recent`、`compact_prompt`、`summary_max_words`。
 
-如果要做 prompt caching，最自然的断点是**在 system 层末尾**——它是整段上下文里最长、最稳定的一段。
-`ContextBuilder.build()` 里 system 层是第一个被 `add_layer` 的、且 `required=True`，
-所以按 `LAYER_ORDER` 拼出来它天然在最前、最完整。要接 Anthropic 的 `cache_control`，
-只需在 `ContextLayer` 上挂一个 `cache_breakpoint: bool` 字段，在 `flatten()` 时对该层最后一条消息打标即可，
-**不需要动压缩和裁剪的任何逻辑**。这就是「把顺序和优先级做成数据」带来的好处。
+### 7.6 `builder.py` —— 门面：把上面四件事串成一次调用
 
-### 4.5 `builder.py` —— 门面：把上面四件事串成一次调用
-
-`ContextBuilder` 对齐 `MemoryManager` 的写法：**对外只暴露少量动作，Agent 侧不需要知道底下分了哪些层、用哪种压缩策略**。
+**负责什么**：`ContextBuilder`——对外只暴露少量动作，Agent 侧不需要知道底下分了哪些层、用哪种压缩策略（对齐 `MemoryManager` 的写法）。
 
 #### 三个动作
 
 ```python
 builder.build(system_prompt=..., history=..., user_input=..., memory_packets=...)  # 拼装 + 裁剪
-builder.observe(tool_name, content)      # 工具结果回来后：判断是否卸载（无脑调用也安全）
-builder.record_turn(user_input, answer)  # 一轮结束：可选地写回工作区
+builder.observe(tool_name, content)          # 工具结果回来后：判断是否卸载（无脑调用也安全）
+builder.record_turn(user_input, answer)      # 一轮结束：可选地写回工作区
 ```
+
+外加 `reset_turn()`（清空本轮工作区）与 `stats()`（概要统计）。
 
 #### build：五层依次就位
 
@@ -636,214 +817,132 @@ builder.record_turn(user_input, answer)  # 一轮结束：可选地写回工作�
         # ---- L1 system：required，不参与裁剪 ----
         if system_prompt:
             system_layer = ContextLayer(name="system", required=True, priority=100)
-            ...
+            system_layer.add(Message("system", system_prompt, metadata={"type": "system", "required": True}))
+            self.window.add_layer(system_layer)
 
         # ---- L2 memory：长期记忆 / 会话摘要 ----
         memory_text = self._render_packets(memory_packets) if memory_packets else ""
-        if memory_text:
-            memory_layer = ContextLayer(name="memory", priority=80)
-            memory_layer.add(Message("user", f"[参考记忆，非用户本轮发言]\n{memory_text}",
-                                     metadata={"type": "memory", "source": "memory"}))
-            self._fit_layer(memory_layer, self._quota_for("memory"), self.counter, warnings)
-            ...
+        ...
 
         # ---- L3 history：滚动窗口，最容易爆的一块 ----
         history_layer = ContextLayer(name="history", priority=60)
         for message in history or []:
             if message.role == "system":
-                continue          # system 由 L1 统一负责，历史里的 system 一律丢弃
+                continue        # system 由 L1 统一负责，历史里的 system 一律丢弃，避免重复注入
             history_layer.add(message)
         report = self.compressor.compress(history_layer, self.counter, self._quota_for("history"))
-
-        # ---- L4 files：卸载回读 / 文件片段 ----
         ...
 
         # ---- L5 user：required，永远最后 ----
         if user_input:
             user_layer = ContextLayer(name="user", required=True, priority=100)
-            user_layer.add(Message("user", user_input, metadata={"type": "user"}))
+            user_layer.add(Message("user", user_input, metadata={"type": "user", "required": True}))
+            self.window.add_layer(user_layer)
 ```
 
-两处值得单独说：
+**为什么 L3 要主动丢弃 `system` 消息**：历史里可能混进旧的 system（比如上一轮注入过的技能提示）。如果照搬，就会出现「两条 system」，且第二条排在历史中间——既浪费 token，又破坏缓存前缀。**统一由 L1 负责 system，是唯一数据源原则在分层里的体现。**
 
-1. **历史里的 system 一律丢弃** —— `buffer` 有可能会把 system 混进来，`self.messages` 里也常驻一条 system。
-   如果 L3 原样搬进去，就会出现**两条 system**（L1 一条 + L3 一条），既浪费 token 又可能让模型困惑。
-   这条规则把「system 只有一条」从「大家都记得别加」变成了「框架替我保证」；
-2. **L2 的配额裁剪走 `_fit_layer`** —— 记忆层不是靠 LLM 摘要压，而是**先尝试卸载、再丢最老的条目**。
-   因为记忆条目本来就是独立可丢的，为它单独调一次 LLM 得不偿失。
-
-#### 分层配额：按比例而非绝对值
+#### 层配额
 
 ```python
-        self.layer_quotas = layer_quotas or {"system": 0.35, "memory": 0.25, "files": 0.25}
-
-    def _quota_for(self, layer_name: str) -> int:
-        if layer_name in self.layer_quotas:
-            return int(self.budget.available * self.layer_quotas[layer_name])
-        fixed = sum(int(self.budget.available * r) for r in self.layer_quotas.values())
-        return max(1, self.budget.available - fixed)    # history 吃剩下的弹性额度
+        self.layer_quotas = layer_quotas or {
+            "system": 0.35, "memory": 0.25, "files": 0.25,
+        }
 ```
 
-设计意图：**给「会疯长」的层设上限，让「天生有界」的层吃剩余**。
+**为什么 system 也给配额**：正常情况 system 不会超，但技能索引 + 工具清单在工具很多时可能很大。给个配额是**防御性设计**：一旦超了，`_fit_layer()` 会告警而不是默默爆掉。`history` 没列在配额里，它拿的是**剩余额度**（`_quota_for()` 里算的 `available - 已分配`）。
 
-- `system` / `memory` / `files` 都是「可能有、也可能没有」的层，各自设 25%~35% 上限，防止某一层独吞预算；
-- `history` 是唯一**必然存在且会持续增长**的层，所以让它吃剩余的弹性额度——历史本来就该是主角；
-- 比例之和不必为 1（这里 0.85），剩下的 0.15 就是弹性空间。
-
-#### 全局兜底：极端情况再丢一次 history
+#### 全局兜底
 
 ```python
-    def _enforce_global_budget(self, warnings) -> None:
+    def _enforce_global_budget(self, warnings: List[str]) -> None:
+        """全局兜底：整体超预算时，从最老的 history 消息成组丢弃"""
         if not self.window.token_count(self.counter) > self.budget.available:
             return
-        history = self.window.get_layer("history")
-        if history is None:
-            warnings.append("已无可压缩的历史层，上下文可能超出模型窗口")
-            return
+        ...
         groups = _group_messages(history.messages)
-        dropped = 0
         while groups and self.window.token_count(self.counter) > self.budget.available:
-            if len(groups) <= self.compressor.keep_recent:    # 保底：最近 N 组不丢
+            if len(groups) <= self.compressor.keep_recent:
                 break
             dropped += len(groups.pop(0))
-        ...
 ```
 
-**为什么分层配额之后还要全局兜底**：分层配额是「各管各的」，但整窗之和仍可能超预算
-（比如 system 0.35 + memory 0.25 + files 0.25 + history 弹性 = 可能超过 1）。
-兜底逻辑再算一次总量，从最老的 history 组继续丢，并且**绝不丢最近的 `keep_recent` 组**——
-那是模型理解当前任务最需要的部分。
+**为什么在层配额之外还要全局兜底**：层配额是按「层」算的，但**总预算**是全局的。「system 用到 35%、memory 也刚好卡到 25%、files 也卡到 25%」——每层都合规，加起来仍可能超。全局兜底就是处理这种「局部合规、整体超标」的情况，并且它**只动 history**（其他层要么 required、要么已经压过）。
 
-#### observe 与 BuildReport
+> **你要接新层 / 调配额时最该看这里**：`build()` 里的层顺序、`layer_quotas` 默认值。
 
-```python
-    def observe(self, tool_name: str, content: str) -> str:
-        """工具结果回来后调一次：超长就卸载，返回可放进 tool 消息的文本"""
-        return self.offloader.offload(tool_name, content)
-```
+### 7.7 `tools.py` —— 让模型自己管理上下文
 
-`observe()` 只是 `offloader.offload()` 的一层薄封装，存在的意义是**给 Agent 一个稳定的调用点**：
-即使将来卸载策略从「落盘」换成「存数据库」或「转摘要」，Agent 侧的调用代码一个字都不用改。
+**负责什么**：4 个 `ToolBase` 工具 + 1 个工厂，让 Agent 能**自己读回卸载内容、自己读写文件**。全部继承既有 `ToolBase`，用 pydantic 定义 `args_schema`。
 
-`BuildReport` 是给日志和调试用的：`describe()` 会打印出「本轮上下文由哪几层构成、各占多少 token」，
-配合 `verbose=True` 使用，排查「为什么这轮这么贵」时一眼就能看出是哪一层在膨胀：
+| 工具 | `name` | 入参（`args_schema`） | 作用 |
+|---|---|---|---|
+| `ReadOffloadedTool` | `read_offloaded` | `offload_id`, `start_line=1`, `max_lines=200` | 按 id 回读卸载内容，支持行区间 |
+| `WriteFileTool` | `write_file` | `path`, `content`, `append=False` | 写文件（自动建父目录） |
+| `EditFileTool` | `edit_file` | `path`, `old_text`, `new_text=""`, `count=1` | 精确字符串替换 |
+| `ListFilesTool` | `list_files` | `path="."`, `recursive=False`, `max_entries=200` | 列目录（等价 `ls`） |
 
-```
-上下文构成：3 层 / 8 条消息 / 1240 token
-  system     1 条   820 token  required
-  history    6 条   320 token
-  user       1 条   100 token  required
-```
-
-### 4.6 `tools.py` —— 让模型自己管理上下文
-
-这些工具让「Agent 自己管理自己的上下文」成为可能，也是对齐记忆模块「自动 + 工具双路径」的成功经验。
-
-已有 `ReadFileTool` 承担读文件，这里补上其余三个，凑齐路线图 F3 要求的 **`ls` / `read` / `write` / `edit` 四件套**：
-
-| 工具 | 作用 | 典型场景 |
-|---|---|---|
-| `read_offloaded` | 按 offload_id 回读被卸载的工具结果 | 上下文里出现「[工具结果已卸载]」时 |
-| `write_file` | 写文件（默认覆盖，`append=True` 追加） | 把中间结果、草稿、清单落盘 |
-| `edit_file` | 精确字符串替换 | 小步修改文件，比整篇重写省 token |
-| `list_files` | 列目录（等价 `ls`） | 不确定文件放哪时先看结构 |
-
-#### 路径沙箱：与 ReadFileTool 完全一致
+#### 路径沙箱：三个文件工具共用
 
 ```python
 def _resolve_in_workspace(workspace: Path, path: str) -> Optional[Path]:
+    """把相对路径解析到 workspace 内；越界返回 None（调用方负责 fail）"""
     target = (workspace / path).resolve()
     try:
         target.relative_to(workspace)
     except ValueError:
-        return None            # 越界 → 调用方返回 ToolResult.fail，不做任何 IO
+        return None
     return target
 ```
 
-**这不是可选项而是底线**：模型可以生成任意的路径字符串，`../../.ssh/id_rsa` 这类输入必须在内层就被挡住。
-先 `resolve()` 消掉 `..` 和符号链接，再用 `relative_to()` 验证，是这个仓库所有文件类工具的统一做法。
-
-#### 二进制拦截
+加一个二进制后缀黑名单，拒绝把文本糊进图片：
 
 ```python
-_BINARY_EXTS = {".png", ".jpg", ..., ".pdf", ".zip", ".so", ".pyd", ".pyc", ".db"}
-...
-        if target.suffix.lower() in _BINARY_EXTS:
-            return ToolResult.fail(f"拒绝以文本方式写入二进制类型文件（{target.suffix}）")
+_BINARY_EXTS = {
+    ".png", ".jpg", ".jpeg", ".gif", ".ico", ".bmp", ".webp",
+    ".pdf", ".zip", ".whl", ".tar", ".gz", ".so", ".pyd", ".pyc", ".db",
+}
 ```
 
-以文本模式往 `.png` / `.db` 里写东西，结果是文件被写坏且无法恢复。**宁可拒绝，也不制造损坏文件。**
+**为什么限定在 workspace 内**：对齐《演进路线图》F3 的验收标准——「Agent 能读写**工作目录内**的文件」。给模型文件系统能力，是对齐 Anthropic「会话状态外化成文件」的关键一步，但**必须画死边界**，否则模型可以读写任意路径。
 
-#### edit_file 的失败提示要能教会模型
+#### 写文件：显式 `newline="\n"`
 
 ```python
-        occurrences = original.count(old_text)
-        if occurrences == 0:
-            return ToolResult.fail(
-                "未找到要替换的原文。请先用 read_file 查看文件，"
-                "确保 old_text 与文件内容逐字符一致（含缩进与空行）。"
-            )
+            with target.open(mode, encoding="utf-8", newline="\n") as f:
+                f.write(content)
 ```
 
-模型做精确替换最常见的失败原因是「凭记忆写 old_text」，缩进和空行对不上。
-错误提示里直接给出**下一步动作**（先用 `read_file` 看原文），比干巴巴一句「未找到」有效得多——
-这也是 `_render_observation` 给错误加前缀「请检查参数或换一个工具/查询方式重试」的同一思路。
+**为什么钉死 `newline="\n"`**：Windows 上 Python 默认会把 `\n` 转成 `\r\n`。如果不显式指定，同一个文件在 Windows 与 Linux 下会产生不同字节，`git status` 满屏假 diff（仓库的 `.gitattributes` 正是为此做了「LF 入库」约定）。工具层在这里与仓库约定保持一致。
 
 #### 工厂：按需组装
 
 ```python
 def build_context_tools(workspace=".", offloader=None, include_filesystem=True) -> List[ToolBase]:
-    tools = []
+    tools: List[ToolBase] = []
     if offloader is not None:
-        tools.append(ReadOffloadedTool(offloader))     # 没卸载器就不给回读工具
+        tools.append(ReadOffloadedTool(offloader))          # ← 有卸载器才有回读工具
     if include_filesystem:
         tools.extend([ListFilesTool(workspace), WriteFileTool(workspace), EditFileTool(workspace)])
     return tools
 ```
 
-**只有传了 `offloader` 才注册 `read_offloaded`**：没有卸载器就不可能有卸载内容，注册了只会让模型看到一个永远查不到东西的工具，
-白白占用 schema token、还可能诱导模型去调它。这个判断让 `build_context_tools` 在「只要文件系统」和「完整 context」两种场景下都能直接用。
+**为什么 `offloader` 是可选参数**：没有卸载器时，「回读」这个动作没有意义（没有东西可读），所以按需生成。这一条让工厂在两种场景下都成立——只想要文件工具的、和要全套的。
 
-### 4.7 `ReActAgent` —— context 已内置于主类
+> **你要加新工具时最该看这里**：照抄任一个类的结构（`name` / `description` / `args_schema` / `run()`），再到工厂里挂上。
 
-和记忆一样，context 也是 `ReActAgent` 的**内置能力**，不需要单独的子类。新增四个构造参数：
+### 7.8 `react_agent.py` —— 接入：context 已内置于主类
 
-```python
-        ctx: Optional["ContextBuilder"] = None,     # 手动注入的构建器（可选）
-        enable_context: bool = False,               # 是否启用（默认关，保持既有行为）
-        context_budget: Optional[int] = None,       # 覆盖 ctx 的窗口预算
-        context_offload_threshold: int = 4_000,     # 触发卸载的字符数
-```
+**负责什么**：`_init_context()` / `_fit_context()` / `_offload_observation()` 三个方法，加上 4 个构造参数。**这是 context 真正「生效」的地方**。
 
-#### 初始化顺序：放在记忆之后就位
-
-```python
-        # 系统提示词，全程只注入这一次
-        self.refresh_system_prompt()
-
-        # 记忆：默认开启
-        self.enable_memory = enable_memory
-        self.memory = (memory or MemoryManager(llm=llm)) if enable_memory else None
-
-        # 上下文工程：默认关闭；放在记忆之后就位，因为 build 要用到 memory 的历史与长期记忆
-        self.enable_context = enable_context
-        if enable_context:
-            self._init_context(ctx, context_budget, context_offload_threshold)
-        else:
-            self.ctx: Optional["ContextBuilder"] = ctx
-```
-
-**顺序不能反**：context 的拼装要用 `memory.buffer` 的历史和 `memory.retrieve()` 的长期记忆，
-所以必须在记忆初始化之后建立。这也解释了为什么 `_init_context` 里要 `refresh_system_prompt()`——
-注册了四个新工具，system 里的工具清单必须同步刷新，否则模型根本不知道有这些工具。
-
-#### `_init_context`：注册工具 + 复用地址
+#### 初始化：建 builder + 注册工具
 
 ```python
         if ctx is None:
             token_budget = TokenBudget(max_context_tokens=budget) if budget else TokenBudget()
             ctx = ContextBuilder(
-                workspace=".", budget=token_budget,
+                workspace=".",
+                budget=token_budget,
                 counter=TokenCounter(model=getattr(self.llm, "model", None) or "gpt-4o-mini"),
                 offloader=ContextOffloader(workspace=".", threshold=offload_threshold),
                 llm=self.llm,
@@ -854,320 +953,167 @@ def build_context_tools(workspace=".", offloader=None, include_filesystem=True) 
         self.refresh_system_prompt()
 ```
 
-注意 `workspace="."` 与 `offloader` 用的是**同一个 workspace**——卸载目录和文件工具必须指向同一个根，
-否则会出现「`write_file` 写在 A 目录、卸载落在 B 目录」的割裂。
+**为什么注册完工具要 `refresh_system_prompt()`**：system 提示词里含工具清单。新注册了 4 个工具，必须刷新 system，模型才知道它们存在。这是 `ReActAgent` 里 `add_tool` 一致的做法。
 
-> **一个已知的粗糙点**：这里 workspace 硬编码为 `"."`（当前工作目录）。
-> 更合理的做法是从配置或构造参数传入，当前保持与 `ReadFileTool` 默认行为一致。
-> 如果你的部署需要固定工作目录，建议显式构造 `ContextBuilder(workspace=...)` 后通过 `ctx=` 注入。
-
-#### `_fit_context`：用拼装结果重建工作区
+#### 重建本轮工作区
 
 ```python
-        system_prompt = next((m.content for m in self.messages.get_messages()
-                              if m.role == "system"), None)
-        history = self.memory.buffer.get_messages() if self.memory else []
-        packets = self._collect_context_packets(input_text)
-
         self.ctx.reset_turn()
-        window = self.ctx.build(system_prompt=system_prompt, history=history,
-                                user_input=input_text, memory_packets=packets)
+        window = self.ctx.build(
+            system_prompt=system_prompt, history=history,
+            user_input=input_text, memory_packets=packets,
+        )
         self.messages.clear()
         for message in window.flatten():
             self.messages.append(message)
 ```
 
-四个要点：
+**为什么要 `reset_turn()` 再 `clear()`**：`reset_turn()` 清的是 builder 内部的 `ContextWindow`，`clear()` 清的是 Agent 的 `self.messages`。两处都不能省——否则上一轮的层结构或消息会残留。走完这一步，`self.messages` 就是**一份按预算裁剪过、层级有序的**工作区。
 
-1. **system 从 `self.messages` 里取**（`refresh_system_prompt` 写的那条），保证工具清单、技能索引是最新的；
-2. **history 只从 `memory.buffer` 取**，`self.messages` 里的东西一律不参与——严格守住单一数据源；
-3. **`reset_turn()` 先清空上一轮残留**，避免窗口越拼越大；
-4. **拼完 `clear()` 再整体写回 `self.messages`**，而不是追加。这样工作区的内容**完全由 window 决定**，
-   下一步循环里的 tool 链才是在这个干净基础上往上加。
-
-#### `_collect_context_packets`：只收记忆，不收历史
+#### 卸载工具结果
 
 ```python
-    def _collect_context_packets(self, query: str):
-        """把记忆层的「长期记忆 + 会话摘要」整理成 ContextPacket 列表
-
-        注意：buffer 的历史不由这里渲染（避免和 history 层重复注入）
-        """
-        packets = []
-        records = self.memory.retrieve(query, limit=self.memory_limit)
-        for r in records:
-            packets.append(f"[{r.kind}] {r.content}")
-        summary = self.memory.buffer.get_summary()
-        if summary:
-            packets.append(f"[历史摘要] {summary}")
-        return packets
-```
-
-**这里的不变量是：`buffer.get_messages()`（历史）只走 history 层，`retrieve()` + `get_summary()`（记忆）只走 memory 层，两者不交叉。**
-`记忆模块编写说明.md` 3.4 节费了很大篇幅解决的「历史重复注入」，
-在 context 接入后由这条分工**结构性保证**——不再是靠「记得别加」，而是靠「两条路取了不同的东西」。
-
-#### `_offload_observation`：工具返回后的卸载钩子
-
-```python
-    def _offload_observation(self, tool_name: str, observation: str) -> str:
         if self.ctx is None or not observation:
-            return observation            # 没开 context → 原样返回
+            return observation
         try:
             return self.ctx.observe(tool_name, observation)
         except Exception as e:
             print(f"⚠️ 工具结果卸载失败，保留原文：{e}")
-            return observation            # ← 卸载失败必须退回原文，不能让工具链断掉
+            return observation
 ```
 
-它在主循环里的位置很关键——**在工具结果渲染之后、放进 `tool` 消息之前**：
+**为什么这里必须 `try/except` 且「失败退回原文」**：卸载是**优化**，不是**功能**。磁盘写满、权限不足、路径异常都可能让卸载失败——但这种时候对话必须继续，绝不能因为「优化失败」而中断工具链。
 
-```python
-                        result = self.tool_registry.invoke_tool(tool_call.name, tool_call.arguments)
-                        observation = _render_observation(result)          # 按 status 加前缀
-                        observation = self._offload_observation(tool_call.name, observation)  # ← 卸载
-                        if self.skill_middleware is not None:
-                            observation = self.skill_middleware.after_tool_call(...)
-                        tool_msg = Message("tool", observation)
-                        tool_msg.metadata = {"tool_call_id": tool_call.id, "name": tool_call.name}
+> **你要改接入逻辑时最该看这里**：三条打印前缀（`🧭`）能帮你确认 context 是否真的在跑。
+
+## 八、快速上手
+
+### 8.1 环境准备（Windows PowerShell）
+
+```powershell
+cd D:\path\to\fast_agents
+
+.\第1步uv_init.bat      # uv init --python 3.10
+.\第2步uv_venv.bat      # uv venv --python 3.10
+.\第3步uv_add.bat       # uv add -r requirements.txt
 ```
 
-顺序是刻意安排的：**先渲染前缀、再卸载**。因为 `_render_observation` 会给错误结果加上
-「[工具执行错误] …… 请检查参数或换一个工具重试」这样的引导语，这是模型纠错的关键信息，
-必须在被卸载之前就拼进文本——否则卸载后模型只看到引用 id，反而丢了纠错线索。
+依赖清单里**不需要为 context 加任何一行**——本模块零新增依赖。想让计数更准，可选装 `tiktoken`：
 
-### 4.8 ⭐ 卸载阈值定多少？—— 一个需要实测的参数
+```powershell
+uv pip install tiktoken      # 可选；不装会自动降级为启发式估算
+```
 
-`context_offload_threshold` 默认 4000 字符。这个数字不是拍脑袋来的，它同时受两个约束：
+> ⚠️ **`test/` 目录与 Python 标准库的 `test` 包同名**。直接 `python -m pytest` 可能引发导入歧义，本仓库的测试文件都用 `python test\test_xxx.py` **直接运行**（文件内部已做 `sys.path.insert`）。跑 context 测试请照此办理。
 
-| 约束 | 上限方向 | 说明 |
-|---|---|---|
-| **模型注意力** | 越小越好 | 单条 tool 结果几千字符后，模型对其中部的利用率明显下降，「lost in the middle」 |
-| **回读成本** | 越大越好 | 每卸载一次，模型可能要多一轮 `read_offloaded`，多一轮 = 多一次 LLM 调用 = 多一次钱和延迟 |
-| **落盘开销** | 越大越好 | 太小的结果落盘，读写文件的开销比省下的 token 更贵 |
-
-实测经验（以 `read_file` 类工具为例）：
-
-- **2000 字符以下**：建议不卸载。这个量级模型能完整消化，卸载属于负优化；
-- **4000~8000 字符**：默认区间。一次 `read_file` 读 200 行大约就落在这里；
-- **10000 字符以上**：强烈建议卸载。这类结果通常是「整篇文档」或「搜索结果页」，
-  模型一次性也读不完，卸载后按需分段读反而更准。
-
-**调参建议**：如果你的任务里模型经常需要「从长结果里找一小段」，阈值可以调小（比如 2000），
-迫使模型用 `read_offloaded` + 行区间精准定位；
-如果任务里模型倾向于「通读长结果再总结」，阈值调大（比如 8000）能减少一次往返。
-
----
-
-## 五、上手：四种典型用法
-
-### 用法 1：最简——只要一个带预算的上下文
+### 8.2 三十秒跑通（零依赖、不需要真实 LLM）
 
 ```python
-from fast_agents.context import ContextBuilder, TokenBudget
+from fast_agents.context import ContextBuilder, TokenBudget, TokenCounter
 
 builder = ContextBuilder(
     workspace=".",
     budget=TokenBudget(max_context_tokens=32_000, reserve_for_output=4_000),
-    verbose=True,                     # 每轮打印上下文构成，调优时打开
+    counter=TokenCounter(),
 )
 
 window = builder.build(
-    system_prompt="你是一个严谨的技术助手。",
-    history=[...],                    # 通常是 memory.buffer.get_messages()
-    user_input="帮我看看这个报错怎么解",
+    system_prompt="你是一个严谨的助手。",
+    history=[],                                    # 也可以喂 Message 列表
+    user_input="用一句话解释上下文工程。",
 )
-messages = window.to_openai_messages()    # 直接喂给 LLM
 print(builder.stats())
-# {'tokens': 1240, 'budget': 27000, 'usage_ratio': 0.046, 'layers': ['system','history','user'], ...}
+# {'tokens': 24, 'budget': 27000, 'usage_ratio': 0.00089,
+#  'layers': ['system', 'user'], 'offloaded_files': 0}
+
+print(window.to_openai_messages())                 # 直接喂 LLM 的格式
 ```
 
-### 用法 2：标准——工具结果自动卸载 + 按需回读
+### 8.3 接到 ReActAgent 上（推荐）
 
 ```python
-from fast_agents.context import ContextBuilder, ContextOffloader, ReadOffloadedTool
+from fast_agents import LLM, ReActAgent
+from fast_agents.tools.builtin import ReadFileTool
 
-offloader = ContextOffloader(workspace=".", threshold=4_000)
-builder = ContextBuilder(workspace=".", offloader=offloader, offload_threshold=4_000)
-
-raw = some_tool.run(...)                       # 假设返回 2 万字符
-observation = builder.observe("web_search", str(raw))
-# → 落盘 .fast_agents/context/offload/<id>.txt，observation 变成一段带 offload_id 的引用
-print(observation)
-
-# 模型想看全文时，通过工具回读（也可以直接调 offloader.read）
-tool = ReadOffloadedTool(offloader)
-print(tool.run(offload_id=offloader.last_id, start_line=1, max_lines=50))
-```
-
-### 用法 3：完整——接进 Agent（推荐）
-
-```python
-from fast_agents.agents.react_agent.react_agent import ReActAgent
-from fast_agents.memory import MemoryManager
-from fast_agents.llm import LLM
-
-llm = LLM()                                    # 读 LLM_MODEL_ID / LLM_API_KEY / LLM_BASE_URL
+llm = LLM(model="gpt-4o-mini", api_key="sk-xxx", base_url="https://api.openai.com/v1")
 
 agent = ReActAgent(
     name="上下文助手",
     llm=llm,
-    memory=MemoryManager(llm=llm),             # 记忆与 context 配合使用
-    enable_context=True,                       # ← 打开上下文工程
-    context_budget=128_000,                    # 模型窗口（按你的模型改）
-    context_offload_threshold=4_000,           # 超过 4 千字符的工具结果自动卸载
+    enable_memory=True,          # 记忆提供 history 与 memory 两层的数据
+    enable_context=True,         # ← 打开上下文工程
+    context_budget=27_000,       # 可选：覆盖默认预算
+    context_offload_threshold=4_000,  # 可选：超过 4000 字符的工具结果落盘
 )
-agent.run("把仓库里所有 TODO 找出来，列成清单写到 notes/todo.md")
+agent.add_tool(ReadFileTool(workspace="."))
+
+print(agent.run("帮我把 README 里的安装步骤整理成一份清单文件"))
 ```
 
-打开后 Agent 会自动：注册 `read_offloaded` / `write_file` / `edit_file` / `list_files`、
-每轮按 token 预算分层拼装上下文、超长工具结果落盘并把引用位置告诉模型。
+开启后，Agent 会打印每轮的上下文账：
 
-### 用法 4：自定义——注入自己的分层配额与压缩策略
+```text
+🧭 上下文工程已启用：预算 27000 token / 计数后端 tiktoken / 卸载阈值 4000 字符
+🤖 上下文助手 开始处理问题: 帮我把 README 里的安装步骤整理成一份清单文件
+🧭 token 预算 475/27000（1.8%，窗口 32000，预留输出 4000）
+```
+
+### 8.4 典型用法
+
+**用法 1：只想要一个带预算的上下文（不接 Agent）**
 
 ```python
-from fast_agents.context import ContextBuilder, ContextCompressor, TokenBudget
+window = builder.build(system_prompt="...", history=history, user_input="...")
+report = builder.last_report
+print(report.describe())         # 逐层 token 明细
+```
 
-# 只卸载 + 摘要，不要裁剪（宁可多花一次 LLM 调用，也不丢中间历史）
+**用法 2：工具结果自动卸载 + 按需回读**
+
+```python
+observation = builder.observe("web_search", 很长的搜索结果)
+# → 超阈值时：落盘 .fast_agents/context/offload/<id>.txt，返回带 offload_id 的引用文本
+# → 未超阈值：原样返回，零 IO
+
+# 模型想看全文时（也可以直接调 offloader.read）
+print(builder.offloader.read(builder.offloader.last_id, start_line=1, max_lines=200))
+```
+
+**用法 3：自定义压缩策略（只卸载 + 摘要，不要裁剪）**
+
+```python
+from fast_agents.context import ContextBuilder, ContextCompressor, ContextOffloader
+
+offloader = ContextOffloader(workspace=".", threshold=8_000)
 compressor = ContextCompressor(
-    llm=llm,
-    offloader=offloader,
-    enable_offload=True,
-    enable_trim=False,          # ← 关掉裁剪
-    enable_summary=True,
-    summary_max_words=300,
-    keep_recent=6,              # 至少保留最近 6 条
+    llm=llm, offloader=offloader,
+    enable_offload=True,     # 卸载：信息不丢
+    enable_trim=False,       # ← 关掉裁剪：宁可多花一次 LLM 调用，也不丢中间历史
+    enable_summary=True,     # 摘要兜底
+    keep_recent=6,
 )
-
-builder = ContextBuilder(
-    workspace=".",
-    budget=TokenBudget(max_context_tokens=200_000, reserve_for_output=8_000),
-    compressor=compressor,
-    layer_quotas={"system": 0.30, "memory": 0.30, "files": 0.20},   # history 吃剩余 0.20 弹性
-    verbose=True,
-)
-
-agent = ReActAgent("助手", llm=llm, ctx=builder, enable_context=True)
+builder = ContextBuilder(workspace=".", compressor=compressor, llm=llm)
 ```
 
-**`ctx=` 与 `enable_context=True` 要一起用**：`ctx` 只负责「用哪个构建器」，`enable_context` 才决定「开不开」。
-只传 `ctx` 不传 `enable_context=True` 时，构建器会被保存但**不生效**（这样你可以先构造好、晚一点再开）。
+**用法 4：离线演示（不接真实 LLM，看完整链路）**
 
----
-
-## 六、常见坑与避坑清单
-
-| 坑 | 现象 | 解法 |
-|---|---|---|
-| **user 输入重复注入** | 开启 context 后，第一次 LLM 调用里出现两条相同的 user 消息 | 主循环追加用户输入前判一次 `not (self.enable_context and self.ctx is not None)`（见 3.4） |
-| **记忆重复注入** | 长期记忆既在 memory 层、又拼在 user 文本里 | `_fit_context()` 后把 `user_input` 还原为 `input_text`；记忆只走 memory 层 |
-| **system 出现两条** | 提示词变长、模型行为怪异 | L1 负责唯一的 system，history 层里的 system 一律 `continue` 丢弃 |
-| **tool 配对被拆坏** | 400：`tool` 消息缺少对应的 `tool_call_id` | 裁剪/摘要一律以**消息组**为单位（`_group_messages`）；用 `window.validate()` 自检 |
-| **没预留输出空间** | 请求成功但回答被截断，或直接 400 | `TokenBudget.reserve_for_output` 必须留，别把窗口全给输入 |
-| **中文被严重低估** | 明明看着不多，一算超了 | 中文必须按「1 字 ≈ 1 token」估，别套英文的 4 字符规则 |
-| **漏算工具 schema** | 消息才占 60%，加 tools 就超了 | 用 `counter.count_tool_schemas(tools)` 单独算一次并计入预算 |
-| **卸载提示不清楚** | 模型反复重试原工具，或干脆无视卸载内容 | 引用文本必须给全「卸载了什么 + 预览 + 怎么取回」（见 4.3） |
-| **卸载失败拖垮对话** | 磁盘满 / 目录无权限 → 整个 run 崩 | `offload()` 内部 catch，退回「截断 + 提示」；`_offload_observation` 再兜一层 |
-| **摘要失败拖垮对话** | 压缩时 LLM 一超时，用户拿不到回答 | `_call_summarize` 双层降级（LLM 失败 → 截断 → `keep_recent` 保底） |
-| **卸载目录无限膨胀** | 长跑服务磁盘被写满 | `max_files`（默认 200）按最早创建淘汰 |
-| **路径穿越** | 模型生成 `../../etc/passwd` | `resolve()` + `relative_to(workspace)` 双重校验；offload_id 走十六进制白名单 |
-| **往二进制文件写文本** | `.png` / `.db` 被写坏且不可恢复 | `_BINARY_EXTS` 白名单拦截，宁可拒绝也不损坏 |
-| **工作目录分裂** | `write_file` 写 A 目录、卸载落 B 目录 | `ContextBuilder`、`ContextOffloader`、文件工具必须用同一个 workspace |
-| **窗口不重置** | 每轮拼装结果越堆越多 | 每轮 `build()` 前调 `reset_turn()`；`build()` 内部本身也会重建 window |
-| **缓存失效** | 成本突然翻倍 | 动态内容（记忆/历史/文件）一律排在静态内容之后；绝不让变动内容进 system 中段 |
-| **摘要压完就忘** | 压完的历史下一轮又冒出来 | 摘要以 `required=True` 的消息写回 history 层开头，而不是丢掉 |
-
----
-
-## 七、下一步演进路线
-
-按优先级排：
-
-1. **语义召回层（记忆与文件统一召回）** —— 现在 memory 层只装 `retrieve()` 的词法召回结果，
-   `ContextPacket.metadata` 字段已留好扩展位。下一步给 `MemoryStore` 加 `search_semantic()`，
-   让 builder 能按语义把「最相关的 N 个片段」排进 memory 层，而不是按词法重叠；
-2. **Prompt caching 断点显式化** —— 给 `ContextLayer` 加 `cache_breakpoint: bool`，
-   在 `flatten()` 时对 system 层（或 system + memory）打 `cache_control` 标记。
-   需要接入支持缓存的模型服务（Anthropic / 部分兼容代理）。这是当前**收益最明确、改动最小**的一项；
-3. **压缩中间件化（Align LangGraph SummarizationNode）** —— 把 `ContextCompressor` 抽象成
-   `ContextMiddleware` 接口（`before_build` / `after_build` 钩子），让压缩策略可以像 `SkillMiddleware`
-   一样在构造时注入，而不是改 `builder.py`。目前三级策略已经是「可插拔开关」，
-   升级成「可插拔实现」是自然的一步；
-4. **子代理隔离的上下文（对齐 CrewAI / DeepAgents）** —— 这一项和 `agents` 模块的 E3 重合：
-   子代理用**独立窗口**执行子任务，只把结果返回主 Agent。这是「用隔离代替压缩」的另一条路，
-   长任务场景下比任何压缩策略都有效；
-5. **跨会话的卸载目录治理** —— 现在 `max_files=200` 是简单淘汰。下一步可按 `session_id` 分目录，
-   会话结束时可选择归档或清理；`index.json` 里已经存了 `tool_name` / `created_at`，够做进一步统计；
-6. **卸载内容的智能摘要** —— 现在卸载时保留的是「原文前 200 字符预览」。
-   可以改成「调一次小的 LLM 摘要」，让引用文本更准确地告诉模型「这里面有什么」，
-   减少不必要的回读。代价是卸载从 O(1) 变成 O(LLM 调用)，建议做成可选项；
-7. **多模态内容块的计数精细化** —— `count_message_tokens` 目前把非文本块统一按 85 token 粗算。
-   不同分辨率的图片实际 token 差异很大，可以按图片尺寸分档；
-8. **与 `tools` 模块的截断协议统一** —— 路线图 tools 模块计划做「统一返回协议 `ToolResponse` + 工具结果截断」，
-   那一层是「工具自己截断」（丢信息），context 这层是「卸载」（不丢信息），
-   两者需要明确分工：**工具截断管「单次结果是否可读」，context 卸载管「上下文是否装得下」**。
-
----
-
-## 八、测试与验证
-
-配套三个可运行文件：
-
-```bash
-# 1. context 模块单元测试（16 项，不依赖真实 LLM）
-python test/test_context.py
-
-# 2. ReActAgent 集成测试（含 context 接入的 2 项专项回归）
-python test/test_react_agent.py
-
-# 3. 端到端演示（5 个示例，全部离线可跑）
-python examples/context/context_react_agent_demo.py
+```powershell
+python examples\context\context_react_agent_demo.py
 ```
 
-**`test_context.py`（16 项）** 覆盖：
+5 个示例依次演示「分层拼装 → 卸载 → 三级压缩 → 文件系统工具 → 完整 ReAct 循环」，全部离线可跑：
 
-```
-✅ test_token_counter                          计数后端与估算降级
-✅ test_token_budget                           预算换算 / 预留输出 / 使用率
-✅ test_window_layer_order                     分层顺序：system → memory → history → files → user
-✅ test_window_validate_tool_pairing           validate 能抓出孤立的 tool 消息
-✅ test_offloader_threshold                    未超阈值不落盘（零 IO）
-✅ test_offloader_offload_and_read             卸载 → 引用文本 → 按 id 回读全文
-✅ test_offloader_read_line_range              行区间分段读取 + 续读提示
-✅ test_offloader_max_files_eviction           超出 max_files 按最早创建淘汰
-✅ test_offloader_safety                       offload_id 白名单拦截路径穿越
-✅ test_compressor_trim_keeps_tool_pairing     成组裁剪，tool 配对不被拆散
-✅ test_compressor_offload_level               第 1 级：卸载超长消息
-✅ test_compressor_summary_level               第 3 级：摘要压缩并写回 layer
-✅ test_builder_pipeline_and_order             五层拼装顺序 + system 去重
-✅ test_builder_budget_trims                   超预算时的分层配额与全局兜底
-✅ test_context_filesystem_tools               write / edit / list 的沙箱与二进制拦截
-✅ test_read_offloaded_tool_and_factory        read_offloaded 工具 + 工厂按需组装
-```
-
-**`test_react_agent.py` 中与 context 相关的 2 项**：
-
-```
-✅ test_context_enabled_builds_and_registers_tools  开启后注册 4 个工具、system 仍只 1 条、user 只 1 条
-✅ test_context_user_input_not_duplicated           多工具步场景下 user 输入不随步数累积
-```
-
-其中 `test_context_user_input_not_duplicated` 是最关键的一条回归断言——
-它把「本轮用户输入的出现次数」**锁死在 1 次**，防止 3.4 节那个「user 重复注入」的 bug 被后续改动重新引入。
-
-**`examples/context/context_react_agent_demo.py` 的 5 个示例**：
-
-```
-示例 1  分层拼装与 token 预算     看「上下文由哪几层组成、各占多少 token」
+```text
+示例 1  分层拼装与 token 预算    看上下文由哪几层组成、各占多少 token
 示例 2  超长工具结果卸载          2 万字符 → 落盘 → 按需 read_offloaded 回读
 示例 3  三级压缩                  卸载 → 裁剪 → 摘要，逐级降级
 示例 4  文件系统工具              write / list / edit，会话状态外化
 示例 5  ReActAgent 接入 context   脚本化假 LLM，离线跑通完整 ReAct 循环
 ```
 
-示例 5 会打印出 Agent 每轮实际送给 LLM 的上下文构成，可以直接看到「分层拼装 + 预算裁剪」在真实循环里的效果：
+示例 5 会打印 Agent 实际送给 LLM 的上下文构成，能直接看到「分层拼装 + 预算裁剪」在真实循环里的效果：
 
-```
+```text
 Agent 本轮送进 LLM 的上下文构成：
   第 1 次调用：2 条消息 / 约 677 token
     - [system   ] 你是一个具备推理和行动能力的AI助手。...
@@ -1179,22 +1125,348 @@ Agent 本轮送进 LLM 的上下文构成：
     - [tool     ] ✅ 已写入 notes/结论.md（28 字符，文件当前 56 字节）
 ```
 
+### 8.5 跑测试
+
+```powershell
+python test\test_context.py        # 预期：16/16 通过
+python test\test_react_agent.py    # 预期：全部通过（含 2 项 context 专项）
+```
+
 ---
 
-## 附：与仓库其他模块的接口速查
+## 九、API 速查
 
-| 上游 / 下游 | 接口 | 说明 |
+### 9.1 `TokenCounter` / `TokenBudget`（`tokens.py`）
+
+```python
+from fast_agents.context import TokenCounter, TokenBudget, estimate_text_tokens, count_message_tokens
+
+counter = TokenCounter(model="gpt-4o-mini", use_tiktoken=True, safety_ratio=1.15)
+counter.backend                       # "tiktoken" 或 "heuristic"
+counter.count("你好，世界")            # 文本 → token
+counter.count_messages(openai_msgs)   # OpenAI 格式消息列表 → token（含请求固定开销）
+counter.count_tool_schemas(tools)     # 工具 schema 列表 → token
+
+budget = TokenBudget(max_context_tokens=32_000, reserve_for_output=4_000, safety_margin=1_000)
+budget.available                      # 27000
+budget.remaining(used)                # 还能放多少
+budget.usage_ratio(used)              # 0~1（>1 超预算）
+budget.is_over(used)                  # bool
+budget.describe(used)                 # 一行日志
+
+estimate_text_tokens("任意文本")       # 纯启发式估算（无需实例）
+count_message_tokens({"role": "user", "content": "hi"})   # 单条消息
+```
+
+### 9.2 `ContextLayer` / `ContextWindow`（`layers.py`）
+
+```python
+from fast_agents.context import ContextLayer, ContextWindow, LAYER_ORDER
+
+window = ContextWindow()
+layer = ContextLayer(name="history", priority=60)
+layer.add(Message("user", "你好")).add(Message("assistant", "你好，有什么可以帮你？"))
+window.add_layer(layer)
+window.append_message("user", Message("user", "再问一句"))   # 层不存在会自动建
+
+window.order                          # LAYER_ORDER（dict）
+window.ordered_layers()               # 按 order 排序后的层
+window.flatten()                      # List[Message]
+window.to_openai_messages()           # List[dict]
+window.token_count(counter)           # int
+window.layer_stats(counter)           # List[dict]
+window.validate()                     # List[str]（空列表 = 没有孤立 tool 消息）
+```
+
+### 9.3 `ContextOffloader`（`offload.py`）
+
+```python
+from fast_agents.context import ContextOffloader
+
+off = ContextOffloader(workspace=".", subdir=".fast_agents/context/offload",
+                       threshold=4_000, preview_chars=400, max_files=200)
+
+off.should_offload(text)              # bool
+off.offload("web_search", text)       # → 引用文本（未超阈值时原样返回 text，零 IO）
+off.last_id                           # 最近一次卸载的 id
+off.read(off.last_id, start_line=1, max_lines=200)   # → 带行号的分段文本
+off.list_records()                    # 按创建时间倒序
+off.get_record(offload_id)            # OffloadRecord 或 None
+len(off)                              # 已卸载文件数
+off.clear()                           # 清空全部卸载文件，返回删除数
+```
+
+### 9.4 `ContextCompressor`（`compressor.py`）
+
+```python
+from fast_agents.context import ContextCompressor, DEFAULT_COMPACT_PROMPT
+
+compressor = ContextCompressor(
+    llm=llm, offloader=offloader,
+    enable_offload=True, enable_trim=True, enable_summary=True,
+    keep_recent=4, summary_max_words=200, compact_prompt=None,   # 不传用 DEFAULT_COMPACT_PROMPT
+)
+report = compressor.compress(layer, counter, budget)   # → CompressionReport
+compressor.accumulated_summary                          # 累积摘要（可跨轮注入）
+compressor.reset()                                      # 清空累积摘要
+```
+
+### 9.5 `ContextBuilder`（`builder.py`）
+
+```python
+from fast_agents.context import ContextBuilder, TokenBudget, TokenCounter, ContextOffloader
+
+builder = ContextBuilder(
+    workspace=".", budget=None, counter=None, offloader=None, compressor=None,
+    llm=None, offload_threshold=4_000, layer_quotas=None, verbose=False,
+)
+
+builder.build(system_prompt=..., history=..., user_input=...,
+              memory_packets=..., file_snippets=...)   # → ContextWindow
+builder.last_report            # BuildReport（本次 build 的报告）
+builder.window                 # 当前 ContextWindow
+builder.observe("tool", text)  # → 可能被替换成引用文本的观察文本
+builder.record_turn(user_input, answer)   # 把本轮写回 history 层（可选）
+builder.reset_turn()           # 清空本轮工作区
+builder.summary                # 压缩器累积的摘要
+builder.stats()                # {'tokens':…, 'budget':…, 'layers':[…], 'offloaded_files':…}
+builder.close()                # 释放资源（当前无长连接，留作扩展位）
+```
+
+`memory_packets` 接受 `ContextPacket` / `dict` / `str` 混合列表，内部由 `_render_packets()` 统一渲染。
+
+### 9.6 context 工具与工厂（`tools.py`）
+
+```python
+from fast_agents.context import (ReadOffloadedTool, WriteFileTool, EditFileTool,
+                                 ListFilesTool, build_context_tools)
+
+tools = build_context_tools(workspace=".", offloader=off, include_filesystem=True)
+# → [ReadOffloadedTool, ListFilesTool, WriteFileTool, EditFileTool]
+for t in tools:
+    agent.add_tool(t)
+
+# 也可以单独构造
+ReadOffloadedTool(off)          # name = "read_offloaded"
+WriteFileTool("D:/code")        # name = "write_file"
+EditFileTool("D:/code")         # name = "edit_file"
+ListFilesTool("D:/code")        # name = "list_files"
+```
+
+### 9.7 `ReActAgent` 侧参数
+
+| 参数 | 默认 | 说明 |
 |---|---|---|
-| **memory → context** | `memory.buffer.get_messages()` | 进 history 层（历史唯一数据源） |
-| **memory → context** | `memory.retrieve(query, limit)` | 进 memory 层（长期记忆参考） |
-| **memory → context** | `memory.buffer.get_summary()` | 进 memory 层（会话摘要） |
-| **context → messages** | `window.to_openai_messages()` | 按层序转成 OpenAI 格式，直接喂 LLM |
-| **context → messages** | `window.flatten()` + `Messages.append()` | 重建 `self.messages` 工作区 |
-| **tools → context** | `ToolResult.output` | 经 `_render_observation` 加前缀后交给 `observe()` |
-| **context → tools** | `build_context_tools(workspace, offloader)` | 生成 4 个工具，`agent.add_tool()` 或直接注册 |
-| **context → skills** | 卸载发生在 `after_tool_call` **之前** | 顺序见 4.7，保证纠错前缀不被卸载吞掉 |
+| `ctx` | `None` | 注入自定义 `ContextBuilder`；不传且 `enable_context=True` 时自动创建 |
+| `enable_context` | `False` | 是否启用上下文工程 |
+| `context_budget` | `None` | 覆盖预算（int token 数）；不传用 `TokenBudget()` 默认 128k |
+| `context_offload_threshold` | `4_000` | 触发卸载的字符数阈值 |
+
+> **已废弃写法**：早期版本构造参数叫 `budget` / `offload_threshold`（与 `ReActAgent` 里其他参数命名打架）。现在统一为 `context_budget` / `context_offload_threshold`，语义更清楚。旧写法不再支持，请改过来。
 
 ---
 
-> **一句话总结本模块的设计**：上下文工程 = **计量（知道有多少）+ 分层（知道放哪、先砍谁）+ 治理（超了怎么办）**。
-> 三者各占一个文件、各解决一个问题，拼起来就是 `ContextBuilder` 的一次 `build()`——**没有魔法，全是账**。
+## 十、设计决策与常见坑
+
+### 10.1 关键设计决策（为什么）
+
+**① 为什么先做 `TokenCounter`，而不是先做压缩？**
+
+因为「裁不裁」的前提是「知道有多少」。没有 token 计数，压缩就没有**触发信号**——你只知道消息条数超了，但不知道超的是 token 还是条数。而且计数是最小可用的地基：`TokenCounter` 单独拿出来就能用（算成本、做日志），压缩则必须建在它之上。
+
+**② 为什么「卸载优先」而不是「摘要优先」？**
+
+因为**卸载信息不丢，摘要信息有损**，而摘要还多花一次 LLM 调用（可能失败、可能限流）。能靠落盘解决的问题，不值得用有损手段。LangChain / LlamaIndex 的主流做法是「裁剪 + 摘要」，本实现刻意把「卸载」插到最前面——这是本模块与它们最大的设计分叉。
+
+**③ 为什么要做成「默认关闭」？**
+
+因为 context 会**改变每轮送给 LLM 的上下文构成**，属于影响行为的改动。默认关闭 → 老代码零改动、行为逐字节不变；想用的人显式打开。这与 `enable_mcp` 默认 `False` 是同一个理由：**影响面大的能力不该默认开**。
+
+**④ 为什么零依赖 + 启发式降级，而不是硬依赖 tiktoken？**
+
+`tiktoken` 是 C 扩展，装不上（网络受限、平台不匹配）的平台不少。硬依赖它，等于把「框架能不能跑」绑死在一个增强功能上。所以本实现让它是**可选增强**：装了更准，没装也能跑。**「能用」优先于「精准」**——这与模块整体定位一致（仓库招牌是「零重型依赖」）。
+
+**⑤ 为什么压缩只对 `history` 做摘要？**
+
+`memory` 层和 `files` 层走的是「只卸载 + 丢最老条目」（`_fit_layer`），不做摘要。因为这两层本身就是**可选参考**——长期记忆和文件片段丢了，模型仍能靠 history 与 system 完成任务；而为它们各加一次 LLM 摘要调用，性价比太低。**把最贵的资源（LLM 调用）花在最不可替代的层（history）上。**
+
+**⑥ 为什么把顺序做成 `LAYER_ORDER` 常量，而不是 `build()` 里的 if-else？**
+
+因为顺序一旦是数据，**裁剪器就不需要知道谁是 system**——它只看 `required` 和 `priority`。要加层只改表，要调优先级只改数字。写成 if-else 则每加一层都要改多处判断，迟早写漏。
+
+### 10.2 常见坑与排查
+
+| 现象 | 原因 / 解决 |
+|---|---|
+| 日志显示「计数后端 heuristic」，担心不准 | 没用上 tiktoken（没装 / 加载失败）。功能正常，只是估算有 ±15% 误差。装 `tiktoken` 即可切到 `tiktoken` 后端 |
+| 开了 `enable_context=True`，但 `layers` 只有 `['system','user']` | `history` 为空。检查是否同时 `enable_memory=True`（history 来自 `memory.buffer`）；无记忆时自然只有 system + user |
+| 卸载文件落在了错误的位置 | 默认 `workspace="."`，即**进程启动目录**。要固定路径，用 `ContextBuilder(workspace="D:/code")` 显式构造后经 `ctx=` 注入 |
+| 模型回读时提示「未找到 offload_id」 | 该卸载文件已被淘汰（`max_files` 默认 200，按最早创建淘汰）。调大 `max_files`，或缩短对话轮数 |
+| 摘要级似乎没生效 | 摘要需要 `llm`。`ContextCompressor` 没拿到 `llm` 时，第 3 级会失败并降级为截断（会打印「上下文摘要失败，降级为截断」） |
+| 上下文里出现两条相同的 user 消息 | 接入边界被破坏。检查是否在 `_fit_context()` 之外又 `append_user()`；回归断言见 `test_context_user_input_not_duplicated` |
+| 请求报 400「tool 消息缺少配对」 | 裁剪时把 `assistant(tool_calls)` 与 `tool` 拆开了。裁剪必须走 `_group_messages()` 成组处理；可用 `window.validate()` 提前自检 |
+| 注册工具时打印「工具 'write_file' 已存在，将被覆盖」 | Agent 里已有同名工具（如你自己注册过）。`register_tool` 是覆盖语义，确认是否要覆盖 |
+| 模型注册了工具却不用 `read_offloaded` | 工具注册后没刷新 system 提示词，模型看不到它。`_init_context()` 里已调 `refresh_system_prompt()`；手工注册时要自己调 |
+| Windows 下写文件产生满屏 `git diff` | 写文件时未指定换行。本模块 `WriteFileTool` 已钉死 `newline="\n"`；自写文件工具要照做 |
+| 中文内容出现乱码方框 | 读写文件未指定编码。统一 `encoding="utf-8"`，读不可信文件时加 `errors="replace"` |
+| `.fast_agents/` 目录被 git 跟踪 | 卸载目录在 workspace 内。建议在 `.gitignore` 加 `.fast_agents/` |
+| `layer_quotas` 比例之和不为 1，是否报错 | 不报错。比例之和不必为 1，多余的视为弹性空间；`history` 拿的是剩余额度 |
+| 层配额都合规，整窗仍超预算 | 这是「局部合规、整体超标」，由 `_enforce_global_budget()` 兜底（成组丢最老 history），会打印告警 |
+| `_seed_workspace()` 与 `_fit_context()` 都跑了，是否重复 | 不重复。`_fit_context()` 用 `reset_turn()` + `clear()` 重建了工作区，会覆盖 seed 的结果。seed 在开启 context 时属于冗余但无害的步骤 |
+| 卸载后模型「失忆」，不再提原文内容 | 引用文本里已教会模型用 `read_offloaded`。若模型不会用，可在 system 提示词里补一句「工具结果提示已卸载时，需要全文请调用 read_offloaded」 |
+| 技能纠错前缀被卸载吞掉 | 顺序问题。`_offload_observation()` 必须在 `skill_middleware.after_tool_call()` **之前**执行，保证纠错前缀不被整段卸载 |
+
+### 10.3 跨平台注意事项（Windows 专项）
+
+本模块涉及文件读写与路径拼接，**在 Windows 上有实际差异**，逐条给可执行解法：
+
+1. **路径分隔符**：全部用 `pathlib.Path`，**不要手工拼 `"\\"` 或 `"/"`**。`_resolve_in_workspace()` 用 `(workspace / path).resolve()`，跨平台一致；
+2. **换行符**：`WriteFileTool` 写文件时显式 `newline="\n"`，避免 Windows 默认转 `\r\n` 造成跨平台字节差异。仓库 `.gitattributes` 已声明「`.py`/`.md`/`.txt`/`.bat` 入库 LF、Windows 检出 CRLF」，工具层与之一致；
+3. **编码**：所有文件读写显式 `encoding="utf-8"`；读用户/模型可能给出的任意文件时用 `errors="replace"`，避免一个坏字节导致整次读取抛异常；
+4. **卸载目录位置**：默认 `workspace="."` 是**进程启动目录**。在 Windows 上用 IDE 运行时启动目录常是项目根或 IDE 安装目录，务必确认；建议显式指定 `workspace`；
+5. **路径空格**：`workspace` 含空格（如 `D:\My Code\...`）时，`pathlib` 本身没问题，但**不要把未加引号的路径拼进 shell 命令**；本模块不调 shell，风险主要在你的自定义工具里；
+6. **脚本解释器**：示例与测试都用 `python test\test_xxx.py` 直接跑（不依赖 pytest），`sys.path.insert` 已处理导入路径，与平台无关。
+
+---
+
+## 十一、测试与验证
+
+### 11.1 测试清单
+
+| 测试文件 | 项数 | 覆盖点 | 运行命令 |
+|---|---|---|---|
+| `test/test_context.py` | 16/16 | 见下 | `python test\test_context.py` |
+| `test/test_react_agent.py` | 全绿 | 含 2 项 context 专项 | `python test\test_react_agent.py` |
+
+`test/test_context.py` 覆盖点（不依赖真实 LLM、不依赖网络）：
+
+1. `TokenCounter` 的启发式估算与消息计数（`test_token_counter`）；
+2. `TokenBudget` 的预算换算与描述（`test_token_budget`）；
+3. `ContextWindow` 的分层顺序与 `flatten`（`test_window_layer_order`）；
+4. `ContextWindow` 的 tool 配对校验（`test_window_validate_tool_pairing`）；
+5. `ContextOffloader` 的阈值判断（不足阈值不落盘）（`test_offloader_threshold`）；
+6. `ContextOffloader` 落盘 + 索引 + 回读（`test_offloader_offload_and_read`）；
+7. `ContextOffloader` 的行区间回读（`test_offloader_read_line_range`）；
+8. `ContextOffloader` 的文件数上限淘汰（`test_offloader_max_files_eviction`）；
+9. `ContextOffloader` 的非法 id / 路径安全（`test_offloader_safety`）；
+10. `ContextCompressor` 第 2 级：裁剪最老历史且不拆 tool 配对（`test_compressor_trim_keeps_tool_pairing`）；
+11. `ContextCompressor` 第 1 级：超长消息被卸载成引用（`test_compressor_offload_level`）；
+12. `ContextCompressor` 第 3 级：LLM 摘要替换历史（`test_compressor_summary_level`）；
+13. `ContextBuilder` 的完整分层拼装顺序（`test_builder_pipeline_and_order`）；
+14. `ContextBuilder` 的预算裁剪（历史被压掉）（`test_builder_budget_trims`）；
+15. context 工具：write / edit / list（`test_context_filesystem_tools`）；
+16. context 工具：read_offloaded 与工厂（`test_read_offloaded_tool_and_factory`）。
+
+> 文件头注释把上面的覆盖点归纳成 **15 条编号**（卸载相关的 5 个测试合并在编号 5–9 一条里），实际测试函数是 **16 个**。以 `main()` 里的清单为准。
+
+### 11.2 关键回归断言
+
+以下断言锁死了设计里最容易被后续改动破坏的约定，**改动 context 或 Agent 时必须保持绿**：
+
+| 断言 | 锁住了什么设计 |
+|---|---|
+| `test_compressor_trim_keeps_tool_pairing` | **tool 配对绝不拆散**：裁剪后不允许出现孤立的 `tool` 消息 |
+| `test_window_validate_tool_pairing` | `ContextWindow.validate()` 能正确识别孤立 `tool` 消息 |
+| `test_offloader_safety` | **路径安全**：非法 id 被拒、不存在的 id 返回可读错误而非抛异常、卸载目录在 workspace 内 |
+| `test_offloader_max_files_eviction` | **有界增长**：超过 `max_files` 按最早创建淘汰 |
+| `test_builder_pipeline_and_order` | **五层拼装顺序**：system 在最前、user 在最后 |
+| `test_react_agent.py::test_context_user_input_not_duplicated` | 接入边界一：**本轮 user 输入只注入一次**，不随工具步数累积 |
+| `test_react_agent.py::test_context_enabled_builds_and_registers_tools` | 接入边界二：开启 context 后 4 个工具确实注册、`agent.ctx` 非空 |
+
+其中 `test_context_user_input_not_duplicated` 是本模块的**头号回归断言**——它锁住「单一数据源」不被后续改动破坏（与记忆模块的 `test_no_duplicate_history_injection` 同一思路）。
+
+### 11.3 全绿基线与手工验证
+
+**全绿基线**（实测结果）：
+
+```text
+$ python test\test_context.py
+...
+✅ context 模块测试全部通过：16/16 项
+
+$ python test\test_react_agent.py
+...
+🎉 全部测试通过
+
+$ python examples\context\context_react_agent_demo.py
+...
+全部示例执行完毕        (exit 0)
+```
+
+**手工验证清单**（改完代码后自己过一遍）：
+
+- [ ] `python -c "from fast_agents.context import ContextBuilder, TokenCounter, ContextOffloader, ContextCompressor"` 无报错；
+- [ ] 开启 `enable_context=True` 后，日志出现「🧭 上下文工程已启用：…」；
+- [ ] 同一轮里 `layers` 顺序为 `['system', 'history'/'memory', 'user']`（system 在前、user 在最后）；
+- [ ] 造一个超长工具结果，确认落盘到 `.fast_agents/context/offload/` 且 `index.json` 有记录；
+- [ ] 用 `read_offloaded` 能回读到内容，且行区间参数生效；
+- [ ] 多工具步场景下，送给 LLM 的 `user` 消息只有一条。
+
+> **测试与实现是否同步**：本模块测试与实现**同步**，16/16 全绿，无红着的测试。若你后续改了裁剪逻辑，请同步更新 `test_compressor_trim_keeps_tool_pairing` 的断言，不要直接删断言。
+
+---
+
+## 十二、下一步演进路线
+
+按优先级排（编号与 [`docs/演进路线图.md`](./演进路线图.md) 模块 F / B / E 保持一致）：
+
+1. **[F4] 压缩中间件化** —— 现在三级策略是 `ContextCompressor` 的方法调用，可开关但不能插拔。目标是抽成与 `skills` 的 `SkillMiddleware` 同构的中间件接口（`before_build` / `after_build`），让「专用摘要器」「按主题裁剪器」都能挂上来。**现在不做的原因**：单模块内部调用已够用，抽中间件要先在多个 Agent 上验证接口稳定性；
+2. **[F5] Prompt caching 断点显式化** —— 顺序已就位（静态在前），但没打 `cache_control`。落点很小：给 `ContextLayer` 加 `cache_breakpoint: bool`，`flatten()` 时对该层最后一条消息打标即可，**不需要动压缩和裁剪逻辑**。现在不做是因为 OpenAI 侧缓存是自动的，只有接 Anthropic 才需要显式断点；
+3. **[F1+] 精确 tokenizer 接入** —— 现在是「tiktoken → 通用编码 → 启发式」三级降级，估算有 ±15% 误差。可增加 provider 级精确计数（如 Anthropic 官方计数接口）作为最高优先级的一级；
+4. **[B2] 语义召回层** —— 目前 memory 层只注入「长期记忆 + 会话摘要」，没有向量召回。`ContextPacket.metadata` 已留扩展位。依赖路线图 B2（语义检索）与 `llm.embed()`；
+5. **[F2+] 流式截断** —— 现在卸载发生在「工具结果已完整返回」之后，对**流式输出过程中**的超长内容无能为力。可加一个「边流边算 token、超阈值即截断」的中间层；
+6. **[F2+] 卸载文件的生命周期管理** —— 现在只有 `max_files` 数量的粗粒度淘汰，没有按时间 / 按会话的清理。长跑服务需要「会话结束时清掉本会话的卸载文件」；
+7. **[B7] 双通道注入** —— 记忆层目前是「检索到就注入」。可改为「命中的注入正文、没命中的只注入标题」，进一步压 token；
+8. **[E3] 子代理上下文隔离** —— 用独立上下文窗口跑子任务，只把结果返回主 Agent。这属于 `agents` 模块，但它能从根上降低单 Agent 的上下文压力，是长任务的关键能力。
+
+> **当前最明显的空缺**：F4（压缩中间件化）与 F5（缓存断点）都只铺了地基。**能跑、能用、能开关，但还不能像 LangGraph 那样把压缩当成一个可编排的图节点。**
+
+---
+
+## 十三、参考
+
+**仓库内**
+
+- `fast_agents/context/`（7 个文件）—— 本模块全部实现；
+- `fast_agents/messages/message.py` / `messages.py`（`Message` / `Messages` / `to_openai_message`）；
+- `fast_agents/tools/tool_base.py` / `tool_result.py`（`ToolBase` / `ToolResult` / `ToolStatus`）；
+- `fast_agents/memory/manager.py` / `buffer.py`（`MemoryManager` / `BufferMemory` / `ContextPacket`）；
+- `fast_agents/agents/react_agent/react_agent.py`（`_init_context` / `_fit_context` / `_offload_observation` / `_seed_workspace`）；
+- `examples/context/context_react_agent_demo.py`、`test/test_context.py`、`test/test_react_agent.py`；
+- `docs/演进路线图.md`（模块 F / B / E 系列）、`docs/记忆模块编写说明.md`（写法范本）。
+
+**外部框架与标准**
+
+- [LangChain `trim_messages`](https://python.langchain.com/docs/how_to/trim_messages/) —— 借鉴「按 token 值裁剪 + 保留最近若干组」；舍弃其重型 Runnable 抽象；
+- [LangGraph `SummarizationNode`](https://langchain-ai.github.io/langgraph/) —— 借鉴「压缩作为图节点、摘要写回 state」；本实现先以方法调用落地；
+- [LlamaIndex `ChatMemoryBuffer` / Context](https://docs.llamaindex.ai/) —— 借鉴「门面 + 让检索结果参与预算排队」；舍弃其索引 / 召回引擎；
+- [CrewAI](https://github.com/crewAIInc/crewAI) —— 借鉴「上下文隔离也是减压手段」的意识；子代理隔离列入 E3；
+- [Anthropic · Effective context engineering for AI agents](https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents) —— 借鉴「compaction + tool result 截断 + 文件回读 + 静态在前」的实践；
+- [langchain-ai/deepagents](https://github.com/langchain-ai/deepagents) —— 借鉴「会话状态外化成文件」「记忆即工具」；不加其依赖。
+
+---
+
+## 附录：发布前自检清单
+
+改动 `fast_agents/context/` 之后，逐条打勾：
+
+- [ ] `python -c "from fast_agents.context import ContextBuilder, ContextWindow, ContextOffloader, ContextCompressor, TokenCounter, TokenBudget, build_context_tools"` 无报错；
+- [ ] `fast_agents/context/__init__.py` 的 `__all__` 与新增导出保持一致；
+- [ ] `fast_agents/__init__.py` 已同步追加新的公开符号；
+- [ ] 新增层的名字已加进 `LAYER_ORDER`，并在 `build()` 里就位；
+- [ ] 裁剪仍走 `_group_messages()` 成组处理（tool 配对未被拆散）；
+- [ ] `ContextWindow.validate()` 对合法上下文返回空列表；
+- [ ] 卸载文件仍落在 `workspace` 内（路径穿越仍被拒）；
+- [ ] `offload()` 在两处保留「失败退回原文 / 截断」的兜底；
+- [ ] 摘要路径仍保留「LLM 失败 → 截断」的双层降级；
+- [ ] 新增/改名工具时同步 `build_context_tools()` 与本文 [9.6](#96-context-工具与工厂toolspy)；
+- [ ] `ReActAgent` 侧的两条接入边界仍被 `test_react_agent.py` 的两条断言覆盖；
+- [ ] 所有 `.py` / `.md` / `.txt` / `.bat` 为 CRLF（或由 `.gitattributes` 统一），`.json` / `.toml` 为 LF；
+- [ ] `python test\test_context.py` 与 `python test\test_react_agent.py` 全绿；
+- [ ] 本文档 [六章](#六核心数据模型)、[九章](#九api-速查) 已随代码同步；
+- [ ] 本文档 [一、更新历史](#一更新历史) 加了一行；
+- [ ] 演进路线相关内容与 [`docs/演进路线图.md`](./演进路线图.md) 编号一致，两处不打架；
+- [ ] 全文无「待补充 / TBD」残留。
+
+> **一句话总结本模块的设计**：上下文工程 = **计量（知道有多少）+ 分层（知道放哪、先砍谁）+ 治理（超了怎么办）**。三者各占一个文件、各解决一个问题，拼起来就是 `ContextBuilder` 的一次 `build()`——**没有魔法，全是账。**
+
