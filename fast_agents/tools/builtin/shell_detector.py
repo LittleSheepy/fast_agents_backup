@@ -1,22 +1,22 @@
-"""win_shell_detector.py
-
+"""shell_detector.py
 Shell 探测与路由模块：
 1. 优先用 shellingham 探测当前终端环境；
 2. 再用命令文本特征判断 CMD / PowerShell；
-3. 最后用 subprocess 试跑兜底。
+3. 最后用父进程/环境变量兜底探测。
+仅支持 Windows，去掉跨平台 bash 相关逻辑。
 """
 
 import os
 import re
+import shutil
 import subprocess
 from typing import Literal, Tuple
-import shutil
 
-ShellType = Literal["cmd", "powershell", "bash", "unknown"]
+ShellType = Literal["cmd", "powershell", "unknown"]
 
-# 检测父进程是 cmd 还是 Power Shell
+
 def detect_parent_shell() -> Tuple[ShellType, str]:
-    # 兜底：通过父进程判断
+    """通过父进程判断当前shell类型"""
     try:
         import psutil
 
@@ -28,13 +28,13 @@ def detect_parent_shell() -> Tuple[ShellType, str]:
                 return "powershell", exe_path
             if pname == "cmd.exe" or "cmd.exe" in exe_path:
                 return "cmd", exe_path
-            if "bash" in pname or "sh" in pname:
-                return "bash", exe_path
     except Exception:
         pass
     return "unknown", ""
 
+
 def detect_shell_by_shellingham() -> Tuple[ShellType, str]:
+    """通过 shellingham 库探测shell"""
     try:
         import shellingham
         name, path = shellingham.detect_shell()
@@ -43,8 +43,6 @@ def detect_shell_by_shellingham() -> Tuple[ShellType, str]:
             return "powershell", path
         if name_lower == "cmd":
             return "cmd", path
-        if name_lower in ("bash", "sh", "zsh", "fish"):
-            return "bash", path
         return "unknown", path
     except ImportError:
         pass
@@ -52,16 +50,21 @@ def detect_shell_by_shellingham() -> Tuple[ShellType, str]:
         pass
     return "unknown", ""
 
+
 def detect_available_shells() -> dict[str, bool]:
+    """检测系统可用的shell"""
     return {
         "cmd": bool(shutil.which("cmd.exe")),
         "powershell": bool(shutil.which("pwsh") or shutil.which("powershell.exe")),
     }
 
+
 def detect_shell_from_env() -> Tuple[ShellType, str]:
+    """通过环境变量判断shell"""
     powershell_path = shutil.which("pwsh") or shutil.which("powershell.exe")
     if powershell_path and "PSMODULEPATH" in os.environ:
         return "powershell", powershell_path
+    
     comspec = os.environ.get("COMSPEC", "").lower()
     if "powershell" in comspec:
         return "powershell", comspec
@@ -73,28 +76,36 @@ def detect_shell_from_env() -> Tuple[ShellType, str]:
     return "unknown", ""
 
 
-
 def detect_shell() -> Tuple[ShellType, str]:
-    """探测当前 Shell。"""
-    # 通过 shellingham 判断
+    """多层级探测当前 Shell，返回(shell类型, 路径)"""
+    # 1. shellingham 库优先
     name, path = detect_shell_by_shellingham()
     if name != "unknown":
         return name, path
 
-    # 兜底：通过父进程判断
+    # 2. 父进程探测兜底
     name, path = detect_parent_shell()
     if name != "unknown":
         return name, path
 
-    # 再兜底：看环境变量
+    # 3. 环境变量兜底
     name, path = detect_shell_from_env()
     if name != "unknown":
         return name, path
 
-    return name, path
+    # 4. Windows 默认优先 powershell
+    ps_path = shutil.which("powershell.exe")
+    if ps_path:
+        return "powershell", ps_path
+    cmd_path = shutil.which("cmd.exe")
+    if cmd_path:
+        return "cmd", cmd_path
+
+    return "unknown", ""
+
 
 def guess_shell_from_command(command: str) -> ShellType:
-    """根据命令文本特征猜测 CMD / PowerShell。"""
+    """根据命令文本特征猜测 CMD / PowerShell，用于路由选择"""
     cmd = command.strip()
     if not cmd:
         return "unknown"
@@ -138,12 +149,11 @@ def guess_shell_from_command(command: str) -> ShellType:
     if re.search(r'\bGet-ChildItem\b|\bSet-Location\b|\bGet-Content\b', cmd):
         ps_score += 1
 
-    # 短命令别名弱特征
+    # 短命令别名
     ps_aliases = {"pwd", "ls", "cat", "rm", "cp", "mv", "ps", "touch", "which", "mkdir", "rmdir"}
     cmd_builtins = {"dir", "copy", "del", "ren", "move", "findstr", "cls", "echo", "cd", "md", "rd"}
 
     first_token = cmd.split()[0].lower()
-
     if first_token in ps_aliases and first_token not in cmd_builtins:
         ps_score += 1
     elif first_token in cmd_builtins and first_token not in ps_aliases:
@@ -155,66 +165,84 @@ def guess_shell_from_command(command: str) -> ShellType:
         return "cmd"
     return "unknown"
 
+
 def run_command(
     command: str,
     shell_type: ShellType = "auto",
-    timeout: int = 10,
-    **kwargs,                       # 透传给 subprocess.run 的额外参数
+    needs_shell: bool = False,
+    **kwargs,
 ):
     """执行命令，自动选择 CMD / PowerShell。
 
     Args:
         command: 要执行的命令字符串。
-        shell_type: "auto" / "cmd" / "powershell" / "bash"。
-        timeout: 超时秒数（可被 kwargs["timeout"] 覆盖）。
-        **kwargs: 其余参数原样透传给 subprocess.run，
-                  如 cwd / env / stdin / check / creationflags 等。
-                  kwargs 中显式指定的值会覆盖本函数设置的默认值。
+        shell_type: "auto" / "cmd" / "powershell"。
+        needs_shell: 是否需要 shell=True（由安全检查模块传入，不下发给 subprocess）。
+        **kwargs: 其余参数原样透传给 subprocess.run（如 cwd、timeout、env 等），
+                  以后新增底层参数无需再改本函数签名。
 
     Returns:
-        (returncode, stdout, stderr)
+        subprocess.CompletedProcess
     """
-
     if shell_type == "auto":
         guessed = guess_shell_from_command(command)
         if guessed in ("cmd", "powershell"):
             effective_shell = guessed
         else:
-            detected_shell, _ = detect_shell() if shell_type == "auto" else (shell_type, "")
+            detected_shell, _ = detect_shell()
             effective_shell = detected_shell if detected_shell in ("cmd", "powershell") else "powershell"
     else:
         effective_shell = shell_type
 
-
-
-    # 1) 组装 subprocess.run 的默认参数
+    # 组装默认参数（timeout 默认 10s；cwd / env 等由调用方按需透传）
     opts = {
         "capture_output": True,
         "text": True,
         "encoding": "utf-8",
         "errors": "replace",
-        "timeout": timeout,
-        "stdin": subprocess.DEVNULL,    # 防止子进程等待输入
+        "timeout": 10,
+        "stdin": subprocess.DEVNULL,
     }
-
-    # 2) 用调用方传入的 kwargs 覆盖默认值（kwargs 优先级更高）
+    
+    # 调用方传入的 kwargs（cwd / env / timeout 等）优先级更高，统一在此合并
     opts.update(kwargs)
 
-    # 3) 按目标 shell 构造 argv，再统一把 opts 透传给 subprocess.run
+    # 如果不需要shell，直接用分词后的argv执行，更安全
+    if not needs_shell:
+        from .command_splitter import split_windows
+        try:
+            argv = split_windows(command)
+            if not argv:
+                raise ValueError("empty command")
+            # 去掉参数外层的引号（Windows argv不需要保留引号）
+            clean_argv = []
+            for part in argv:
+                if len(part) >= 2 and part.startswith('"') and part.endswith('"'):
+                    clean_argv.append(part[1:-1])
+                else:
+                    clean_argv.append(part)
+            return subprocess.run(clean_argv, shell=False, **opts)
+        except Exception:
+            # 分词失败就回退到shell模式
+            pass
+
+    # 需要shell的情况：按目标shell构造argv
     if effective_shell == "cmd":
         argv_or_cmd = ["cmd", "/c", command]
-    elif effective_shell == "powershell":
+    else:  # powershell
         argv_or_cmd = ["powershell", "-NoProfile", "-Command", command]
-    else:
-        # bash / 其他：交给系统 shell 解析
-        argv_or_cmd = command
-        opts.setdefault("shell", True)   # 字符串命令需要 shell=True；kwargs 已给则尊重 kwargs
-
-    return subprocess.run(argv_or_cmd, **opts)
+    
+    return subprocess.run(argv_or_cmd, shell=False, **opts)
 
 
-def route_and_run(command: str, timeout: int = 10) -> Tuple[int, str, str, ShellType]:
-    """路由并执行：先试首选 Shell，失败则回退到另一个。"""
+def route_and_run(command: str, needs_shell: bool = False, **kwargs) -> Tuple[int, str, str, ShellType]:
+    """路由并执行：先试首选 Shell，失败则回退到另一个。
+
+    Args:
+        command: 要执行的命令字符串。
+        needs_shell: 是否需要 shell=True（由安全检查模块传入，不下发给 subprocess）。
+        **kwargs: 其余参数原样透传给 run_command / subprocess.run（如 cwd、timeout、env 等）。
+    """
     detected_shell, _ = detect_shell()
     guessed = guess_shell_from_command(command)
 
@@ -228,16 +256,22 @@ def route_and_run(command: str, timeout: int = 10) -> Tuple[int, str, str, Shell
 
     fallback = "cmd" if preferred == "powershell" else "powershell"
 
-    proc = run_command(command, shell_type=preferred, timeout=timeout)
-    rc, out, err = proc.returncode, proc.stdout, proc.stderr
-    if rc == 0 or not err.strip():
-        return rc, out, err, preferred
+    try:
+        proc = run_command(command, shell_type=preferred, needs_shell=needs_shell, **kwargs)
+        rc, out, err = proc.returncode, proc.stdout, proc.stderr
+        if rc == 0 or not err.strip():
+            return rc, out, err, preferred
+    except Exception as e:
+        rc, out, err = -1, "", str(e)
 
-    # 回退
-    proc = run_command(command, shell_type=fallback, timeout=timeout)
-    rc2, out2, err2 = proc.returncode, proc.stdout, proc.stderr
-    if rc2 == 0 or not err2.strip():
-        return rc2, out2, err2, fallback
+    # 回退尝试另一个shell
+    try:
+        proc = run_command(command, shell_type=fallback, needs_shell=needs_shell, **kwargs)
+        rc2, out2, err2 = proc.returncode, proc.stdout, proc.stderr
+        if rc2 == 0 or not err2.strip():
+            return rc2, out2, err2, fallback
+    except Exception:
+        pass
 
     # 都失败，返回首选的结果
     return rc, out, err, preferred
@@ -250,7 +284,6 @@ if __name__ == "__main__":
     test_commands = [
         "echo %USERNAME%",
         "echo $env:USERNAME",
-        "Get-Process | Select-Object -First 3",
         "dir",
     ]
 
