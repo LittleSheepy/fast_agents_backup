@@ -9,6 +9,7 @@ fast_agents/tools/builtin/terminal_tool.py
 from __future__ import annotations
 
 import os
+import locale
 import subprocess
 from pathlib import Path
 from typing import List, Optional, Set, Tuple, Union
@@ -187,9 +188,11 @@ class TerminalTool(ToolBase):
         # ========== 智能判断是否需要shell=True ==========
         needs_shell_flag = need_shell(raw_command)
 
+        enc = locale.getpreferredencoding(False) or "utf-8"
         try:
             rc, output, err, used_shell = route_and_run(
                 raw_command,
+                encoding=enc,
                 cwd=str(self._cwd),
                 timeout=self.timeout,
                 needs_shell=needs_shell_flag,
